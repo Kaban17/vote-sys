@@ -30,11 +30,19 @@ type adminOptionCount struct {
 	Percent  float64 `json:"percent"` // от Voters, не от суммы
 }
 
-func (s *Server) handleCreatePoll(w http.ResponseWriter, r *http.Request)  { /* TODO */ }
-func (s *Server) handleListPolls(w http.ResponseWriter, r *http.Request)   { /* TODO */ }
-func (s *Server) handleAdminGetPoll(w http.ResponseWriter, r *http.Request) { /* TODO */ }
+func (s *Server) handleCreatePoll(w http.ResponseWriter, r *http.Request) {
+	notImplemented(w, "шаг 2")
+}
+func (s *Server) handleListPolls(w http.ResponseWriter, r *http.Request) {
+	notImplemented(w, "шаг 2")
+}
+func (s *Server) handleAdminGetPoll(w http.ResponseWriter, r *http.Request) {
+	notImplemented(w, "шаг 2")
+}
 
 // handleAdminResults отдаёт агрегаты в любой момент, включая время голосования,
 // и не кэшируется. Публичный эндпоинт результатов до закрытия молчит по
 // методологическим причинам, но оператор видеть цифры должен.
-func (s *Server) handleAdminResults(w http.ResponseWriter, r *http.Request) { /* TODO */ }
+func (s *Server) handleAdminResults(w http.ResponseWriter, r *http.Request) {
+	notImplemented(w, "шаг 6")
+}

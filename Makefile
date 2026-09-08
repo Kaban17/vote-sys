@@ -24,8 +24,8 @@ down: ## Остановить стенд и удалить тома
 logs: ## Логи приложения
 	docker compose logs -f api1 api2 api3
 
-migrate: ## Применить миграции
-	docker compose exec -T postgres psql -U vote -d vote < migrations/0001_init.up.sql
+migrate: ## Применить миграции (идемпотентно; при первом старте их уже прогнал compose)
+	docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U vote -d vote < migrations/0001_init.up.sql
 
 seed: ## Создать демо-опрос через админский API
 	./scripts/seed.sh

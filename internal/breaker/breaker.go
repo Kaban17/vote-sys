@@ -21,9 +21,9 @@ import "time"
 type State int
 
 const (
-	Closed State = iota // всё хорошо, запросы идут
-	Open                // цепь разомкнута, запросы не идут вовсе
-	HalfOpen            // пропускается одиночный probe
+	Closed   State = iota // всё хорошо, запросы идут
+	Open                  // цепь разомкнута, запросы не идут вовсе
+	HalfOpen              // пропускается одиночный probe
 )
 
 type Config struct {

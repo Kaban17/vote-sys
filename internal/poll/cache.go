@@ -18,8 +18,8 @@ type Cache struct {
 	store *Store
 	group singleflight.Group
 
-	mu     sync.RWMutex
-	byID   map[uuid.UUID]*Poll
+	mu   sync.RWMutex
+	byID map[uuid.UUID]*Poll
 }
 
 func NewCache(store *Store) *Cache {

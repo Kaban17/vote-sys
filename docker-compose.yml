@@ -29,7 +29,12 @@ services:
       timeout: 2s
       retries: 15
 
+  # Образ собирается ОДИН раз и переиспользуется всеми инстансами: они отличаются
+  # только ординалом, то есть шардом счётчиков. Отдельная сборка на сервис
+  # означала бы три прогона одного и того же Dockerfile — втрое дольше и без
+  # какой-либо выгоды.
   api1: &api
+    image: vote-sys-api:local
     build: .
     env_file: .env
     environment:
@@ -42,13 +47,23 @@ services:
 
   api2:
     <<: *api
+    build: !reset null
     environment:
       INSTANCE_ORDINAL: 1
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      api1: {condition: service_started}
 
   api3:
     <<: *api
+    build: !reset null
     environment:
       INSTANCE_ORDINAL: 2
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      api1: {condition: service_started}
 
   nginx:
     image: nginx:1.27-alpine

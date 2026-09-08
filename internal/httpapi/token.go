@@ -30,4 +30,5 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 	//   })
 	//   w.Header().Set("Cache-Control", "no-store")
 	//   204
+	notImplemented(w, "шаг 3")
 }

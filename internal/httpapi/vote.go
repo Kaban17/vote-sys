@@ -21,11 +21,11 @@ type voteResponse struct {
 // handleVote — горячий путь. Порядок проверок: от бесплатных к дорогим
 // (architecture.md §3).
 //
-//	1. now() >= ends_at + grace       → 410   in-memory, 0 RTT
-//	2. валидация option_ids            → 400   in-memory
-//	3. SET NX EX dedup                 → 409   единственный RTT
-//	4. counters.Add                            in-memory, без блокировок
-//	5. 200 {"accepted": true}
+//  1. now() >= ends_at + grace       → 410   in-memory, 0 RTT
+//  2. валидация option_ids            → 400   in-memory
+//  3. SET NX EX dedup                 → 409   единственный RTT
+//  4. counters.Add                            in-memory, без блокировок
+//  5. 200 {"accepted": true}
 //
 // Почему именно так: после окончания ролика прилетает много запросов к закрытому
 // опросу — зрители досматривают запись и дожимают кнопку. Дешёвая проверка
@@ -52,4 +52,5 @@ func (s *Server) handleVote(w http.ResponseWriter, r *http.Request) {
 	//   ~1600 из 10 млн, при плановом рестарте ноль (architecture.md §5.4).
 	//
 	//   counters.Add(idx); writeJSON(w, 200, voteResponse{Accepted: true})
+	notImplemented(w, "шаг 4")
 }

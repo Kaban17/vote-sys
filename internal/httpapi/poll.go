@@ -33,7 +33,8 @@ type optionResponse struct {
 }
 
 func (s *Server) handleGetPoll(w http.ResponseWriter, r *http.Request) {
-	// TODO: из процессного кэша, не из Postgres.
+	// TODO(шаг 4): из процессного кэша, не из Postgres.
+	notImplemented(w, "шаг 4")
 }
 
 // handlePublicResults — публичные результаты, доступны только после закрытия.
@@ -49,10 +50,23 @@ func (s *Server) handleGetPoll(w http.ResponseWriter, r *http.Request) {
 // миллионов. Вторая волна трафика приходит именно сюда, синхронно по таймеру
 // у всех зрителей.
 func (s *Server) handlePublicResults(w http.ResponseWriter, r *http.Request) {
-	// TODO
+	notImplemented(w, "шаг 6")
 }
 
+// handleHealth — readiness, а не liveness.
+//
+// Отдаёт 200 только после прогрева: пулы подняты, метаданные armed-опросов в
+// памяти. До этого 503, и nginx не шлёт на инстанс трафик. Разница существенна
+// именно из-за импульсного профиля — инстанс, вставший в строй недопрогретым,
+// встретит пик установкой соединений (architecture.md §6).
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	// TODO: readiness должен учитывать прогрев — инстанс не готов, пока не
-	// подняты пулы и не загружены armed-опросы (architecture.md §6).
+	w.Header().Set("Cache-Control", "no-store")
+	if !s.ready.Load() {
+		writeError(w, http.StatusServiceUnavailable, "not_ready", "инстанс ещё не прогрет")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status": "ok",
+		"shard":  s.cfg.Shard(),
+	})
 }
