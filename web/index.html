@@ -1,0 +1,42 @@
+<!doctype html>
+<!--
+  Лендинг зрителя. Чистая статика: никакого Set-Cookie, никакого
+  персонализированного содержимого. Кэшируется CDN агрессивно и до origin не
+  доходит (architecture.md §5.1).
+
+  Токен запрашивается ОТДЕЛЬНЫМ POST-запросом из скрипта ниже. Разделение
+  принципиальное: если бы кука ставилась при отдаче этой страницы, один
+  закэшированный ответ раздал бы один токен всем 100 млн зрителей.
+-->
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Голосование</title>
+</head>
+<body>
+  <main id="app">
+    <h1 id="question"></h1>
+    <form id="options"></form>
+    <p id="timer"></p>
+    <p id="status"></p>
+  </main>
+
+  <script>
+    // TODO:
+    //   1. pollID из пути /p/{id}
+    //   2. POST /api/token          → ставит куку, некэшируемо by design
+    //   3. GET  /api/polls/{id}     → вопрос, опции, ends_at, server_time
+    //   4. Таймер считается по OFFSET между server_time и Date.now(), а не по
+    //      часам устройства: на потребительских телефонах они врут на минуты,
+    //      и иначе у части зрителей кнопка погаснет на десятой секунде ролика
+    //      (architecture.md §5.5).
+    //   5. POST /api/polls/{id}/vote
+    //      200 → «голос принят»; цифр не показываем (bandwagon effect,
+    //      architecture.md §5.2)
+    //      409 → «вы уже голосовали»
+    //      410 → «голосование завершено»
+    //      429 → «слишком часто»
+  </script>
+</body>
+</html>

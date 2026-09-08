@@ -1,0 +1,60 @@
+# Локальный стенд повторяет продовую топологию в миниатюре:
+# nginx перед несколькими stateless-инстансами, общий Redis, общий Postgres.
+# Три инстанса, а не один, — чтобы дедуп, шардирование счётчиков и идемпотентный
+# upsert проверялись в тех же условиях, в которых работают в проде (architecture.md §5.7).
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: vote
+      POSTGRES_PASSWORD: vote
+      POSTGRES_DB: vote
+    volumes:
+      - ./migrations/0001_init.up.sql:/docker-entrypoint-initdb.d/0001_init.up.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vote"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  redis:
+    image: redis:7-alpine
+    # appendonly не включаем: Redis здесь — точка синхронизации, а не хранилище.
+    # Потеря состояния переживается через generation (architecture.md §5.7, §6).
+    command: redis-server --save "" --appendonly no --maxmemory-policy noeviction
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  api1: &api
+    build: .
+    env_file: .env
+    environment:
+      INSTANCE_ORDINAL: 0
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    # Инстансы прогреваются при старте: пулы соединений создаются заранее,
+    # а не лениво по первому запросу (architecture.md §6).
+
+  api2:
+    <<: *api
+    environment:
+      INSTANCE_ORDINAL: 1
+
+  api3:
+    <<: *api
+    environment:
+      INSTANCE_ORDINAL: 2
+
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - ./deploy/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./web:/var/www/web:ro
+    depends_on: [api1, api2, api3]

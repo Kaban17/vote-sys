@@ -1,0 +1,37 @@
+<!doctype html>
+<!--
+  Админка: создание опроса и просмотр агрегатов. Cold path, нагрузка
+  пренебрежима (architecture.md §3).
+
+  В отличие от публичного лендинга, здесь результаты видны и во время
+  голосования: методологическое ограничение на показ промежуточных цифр
+  относится к зрителям, а не к оператору.
+-->
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Админка опросов</title>
+</head>
+<body>
+  <main>
+    <h1>Опросы</h1>
+    <section id="create"></section>
+    <section id="list"></section>
+    <section id="results"></section>
+  </main>
+
+  <script>
+    // TODO:
+    //   Bearer из localStorage → заголовок Authorization
+    //   POST /api/admin/polls
+    //   GET  /api/admin/polls
+    //   GET  /api/admin/polls/{id}/results — поллинг раз в секунду
+    //
+    //   Проценты считать от voters, а не от суммы голосов: при multiple один
+    //   зритель увеличивает несколько счётчиков (architecture.md §5.8).
+    //   Показывать stale_for_ms — результаты eventually consistent, и честнее
+    //   это показать, чем делать вид, что цифры реальном времени.
+  </script>
+</body>
+</html>
