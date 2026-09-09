@@ -50,24 +50,26 @@ func TestHealthzGatedOnReadiness(t *testing.T) {
 	}
 }
 
-// Нереализованные хендлеры обязаны быть отличимы от реализованных: пустой 200
-// ввёл бы в заблуждение при первом же сквозном прогоне.
-//
-// Остались только результаты: всё прочее уже реализовано и отвечает по существу
-// (401 без админского токена, 400 на некорректный ввод).
-func TestUnimplementedHandlersReturn501(t *testing.T) {
+// Все ручки реализованы: 501 не должно возвращать ничто. Тест держит это
+// свойство — заглушка, случайно оставленная в коде, провалит его.
+func TestNoHandlerReturns501(t *testing.T) {
 	srv := quiet(NewServer(&config.Config{CounterShards: 1, AccessLogSampleN: 1}, Deps{}))
 	srv.MarkReady()
 	h := srv.Routes()
 
 	cases := []struct{ method, path string }{
+		{http.MethodGet, "/api/polls/x"},
+		{http.MethodPost, "/api/polls/x/vote"},
 		{http.MethodGet, "/api/polls/x/results"},
+		{http.MethodPost, "/api/admin/polls"},
+		{http.MethodGet, "/api/admin/polls"},
+		{http.MethodGet, "/api/admin/polls/x/results"},
 	}
 	for _, c := range cases {
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, httptest.NewRequest(c.method, c.path, nil))
-		if rec.Code != http.StatusNotImplemented {
-			t.Errorf("%s %s → %d, want 501", c.method, c.path, rec.Code)
+		if rec.Code == http.StatusNotImplemented {
+			t.Errorf("%s %s всё ещё отдаёт 501", c.method, c.path)
 		}
 	}
 }

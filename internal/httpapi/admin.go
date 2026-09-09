@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -146,7 +147,62 @@ func (s *Server) handleAdminGetPoll(w http.ResponseWriter, r *http.Request) {
 // и не кэшируется. Публичный эндпоинт результатов до закрытия молчит по
 // методологическим причинам, но оператор видеть цифры должен.
 func (s *Server) handleAdminResults(w http.ResponseWriter, r *http.Request) {
-	notImplemented(w, "шаг 6")
+	w.Header().Set("Cache-Control", "no-store")
+
+	id, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "id: ожидается uuid")
+		return
+	}
+	p, err := s.cache.Get(r.Context(), id)
+	if err != nil {
+		s.writeStoreError(w, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, s.resultsOf(r.Context(), p))
+}
+
+// resultsOf собирает ответ из снапшота в памяти, а при его отсутствии — из
+// Postgres.
+//
+// Снапшот первичен: он свежее (обновляется раз в секунду против пяти) и не
+// требует запроса в базу. Postgres нужен для опросов, выпавших из окна
+// отслеживания, — например, закончившихся вчера.
+func (s *Server) resultsOf(ctx context.Context, p *poll.Poll) adminResultsResponse {
+	var (
+		votes  map[uuid.UUID]int64
+		voters int64
+		stale  int64
+	)
+
+	if snap, ok := s.snapshots.Get(p.ID); ok {
+		votes, voters = snap.Votes, snap.Voters
+		stale = time.Since(snap.TakenAt).Milliseconds()
+	} else if agg, err := s.polls.Results(ctx, p.ID); err == nil {
+		votes, voters = agg.Votes, agg.Voters
+	}
+
+	out := adminResultsResponse{
+		PollID:     p.ID.String(),
+		Voters:     voters,
+		StaleForMS: stale,
+		Results:    make([]adminOptionCount, len(p.Options)),
+	}
+	for i, o := range p.Options {
+		n := votes[o.ID]
+		// Проценты считаются от числа участников, а не от суммы голосов: при
+		// kind = multiple один зритель увеличивает несколько счётчиков, и
+		// проценты от суммы дали бы больше 100% (architecture.md §5.8).
+		var pct float64
+		if voters > 0 {
+			pct = float64(n) / float64(voters) * 100
+		}
+		out.Results[i] = adminOptionCount{
+			OptionID: o.ID.String(), Text: o.Text, Votes: n, Percent: pct,
+		}
+	}
+	return out
 }
 
 // writeStoreError переводит ошибку домена в код ответа.

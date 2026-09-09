@@ -13,6 +13,7 @@ import (
 	"github.com/boar/vote-sys/internal/config"
 	"github.com/boar/vote-sys/internal/dedup"
 	"github.com/boar/vote-sys/internal/poll"
+	"github.com/boar/vote-sys/internal/results"
 	"github.com/boar/vote-sys/internal/token"
 	"github.com/boar/vote-sys/internal/vote"
 )
@@ -31,36 +32,37 @@ type Server struct {
 	logger *slog.Logger
 	stats  *accessStats
 
-	polls   *poll.Store
-	cache   *poll.Cache
-	tokens  *token.Issuer
-	batcher *vote.Batcher
-	dedup   dedup.Checker
-
-	// TODO(шаг 6): results.Snapshotter.
+	polls     *poll.Store
+	cache     *poll.Cache
+	tokens    *token.Issuer
+	batcher   *vote.Batcher
+	dedup     dedup.Checker
+	snapshots *results.Snapshotter
 }
 
 // Deps — внешние зависимости сервера. Структурой, а не позиционными
 // аргументами: их станет шесть к шагу 6, и порядок в вызове перестанет
 // читаться.
 type Deps struct {
-	Polls   *poll.Store
-	Cache   *poll.Cache
-	Tokens  *token.Issuer
-	Batcher *vote.Batcher
-	Dedup   dedup.Checker
+	Polls     *poll.Store
+	Cache     *poll.Cache
+	Tokens    *token.Issuer
+	Batcher   *vote.Batcher
+	Dedup     dedup.Checker
+	Snapshots *results.Snapshotter
 }
 
 func NewServer(cfg *config.Config, deps Deps) *Server {
 	return &Server{
-		cfg:     cfg,
-		logger:  slog.Default(),
-		stats:   newAccessStats(uint64(cfg.AccessLogSampleN)),
-		polls:   deps.Polls,
-		cache:   deps.Cache,
-		tokens:  deps.Tokens,
-		batcher: deps.Batcher,
-		dedup:   deps.Dedup,
+		cfg:       cfg,
+		logger:    slog.Default(),
+		stats:     newAccessStats(uint64(cfg.AccessLogSampleN)),
+		polls:     deps.Polls,
+		cache:     deps.Cache,
+		tokens:    deps.Tokens,
+		batcher:   deps.Batcher,
+		dedup:     deps.Dedup,
+		snapshots: deps.Snapshots,
 	}
 }
 

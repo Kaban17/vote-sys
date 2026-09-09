@@ -1,48 +1,124 @@
-// Package results отвечает за чтение агрегатов из Redis и их перенос в Postgres.
 package results
 
 import (
 	"context"
+	"log/slog"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/redis/go-redis/v9"
 )
 
 // Snapshot — агрегат опроса на момент времени.
 type Snapshot struct {
-	PollID  uuid.UUID
-	Votes   map[uuid.UUID]int64
-	Voters  int64 // знаменатель для процентов (architecture.md §5.8)
+	PollID uuid.UUID
+	// Votes — по идентификатору варианта.
+	Votes map[uuid.UUID]int64
+	// Voters — число проголосовавших, знаменатель для процентов. При
+	// kind = multiple не равно сумме голосов (architecture.md §5.8).
+	Voters  int64
 	TakenAt time.Time
+}
+
+// Sum — сумма голосов по вариантам. Для kind = single обязана совпадать с
+// Voters; этот инвариант дёшево ловит ошибки батчера и шардирования.
+func (s *Snapshot) Sum() int64 {
+	var total int64
+	for _, n := range s.Votes {
+		total += n
+	}
+	return total
+}
+
+// Tracker сообщает, по каким опросам собирать агрегаты.
+type Tracker interface {
+	// TrackedIDs возвращает опросы, закончившиеся позже указанного момента:
+	// идущие сейчас плюс те, у кого ещё досходятся последние батчи.
+	TrackedIDs(after time.Time) []uuid.UUID
 }
 
 // Snapshotter — читающее зеркало батчера.
 //
 // Симметрия намеренная: батч на запись, батч на чтение, и Redis не видит ни
-// 250K записей, ни 250K чтений. Инстанс раз в секунду делает HGETALL по всем
-// шардам и складывает результат в атомарный снапшот в памяти
-// (architecture.md §5.2).
+// 250K записей, ни 250K чтений (architecture.md §5.2).
 type Snapshotter struct {
-	rdb    redis.UniversalClient
-	shards int
-	every  time.Duration
-	// TODO: atomic.Pointer[map[uuid.UUID]*Snapshot]
+	src     Source
+	tracker Tracker
+	shards  int
+	every   time.Duration
+	// settle — сколько ещё собирать агрегаты после конца опроса, пока
+	// долетают последние батчи со всех инстансов.
+	settle time.Duration
+	log    *slog.Logger
+
+	// Читатели ходят сюда на каждый запрос к результатам, писатель — раз в
+	// секунду, поэтому атомарный указатель на неизменяемую карту вместо
+	// блокировок.
+	current atomic.Pointer[map[uuid.UUID]*Snapshot]
 }
 
-func NewSnapshotter(rdb redis.UniversalClient, shards int, every time.Duration) *Snapshotter {
-	return &Snapshotter{rdb: rdb, shards: shards, every: every}
+func NewSnapshotter(src Source, tracker Tracker, shards int, every, settle time.Duration, log *slog.Logger) *Snapshotter {
+	s := &Snapshotter{src: src, tracker: tracker, shards: shards, every: every, settle: settle, log: log}
+	empty := make(map[uuid.UUID]*Snapshot)
+	s.current.Store(&empty)
+	return s
 }
 
-func (s *Snapshotter) Run(ctx context.Context) error {
-	// TODO: тикер → для каждого активного опроса собрать shards хешей и
-	// shards счётчиков voters, просуммировать, положить в atomic.Pointer.
-	return nil
+func (s *Snapshotter) Run(ctx context.Context) {
+	t := time.NewTicker(s.every)
+	defer t.Stop()
+
+	s.Refresh(ctx)
+	for {
+		select {
+		case <-t.C:
+			s.Refresh(ctx)
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
-// Get возвращает последний снапшот без блокировок. Устарел максимум на
-// SNAPSHOT_INTERVAL.
+// Refresh пересобирает снапшоты всех отслеживаемых опросов.
+func (s *Snapshotter) Refresh(ctx context.Context) {
+	now := time.Now()
+	ids := s.tracker.TrackedIDs(now.Add(-s.settle))
+
+	next := make(map[uuid.UUID]*Snapshot, len(ids))
+	prev := *s.current.Load()
+
+	for _, id := range ids {
+		raw, err := s.src.Read(ctx, id, s.shards)
+		if err != nil {
+			// Сохраняем предыдущий снапшот: устаревшие цифры полезнее
+			// исчезнувших, а результаты и так eventually consistent.
+			if old, ok := prev[id]; ok {
+				next[id] = old
+			}
+			s.log.Error("не удалось прочитать агрегаты", "poll_id", id, "err", err)
+			continue
+		}
+
+		snap := &Snapshot{PollID: id, Votes: make(map[uuid.UUID]int64, len(raw.Votes)), Voters: raw.Voters, TakenAt: now}
+		for optRaw, n := range raw.Votes {
+			optID, err := uuid.Parse(optRaw)
+			if err != nil {
+				continue
+			}
+			snap.Votes[optID] = n
+		}
+		next[id] = snap
+	}
+
+	s.current.Store(&next)
+}
+
+// Get возвращает последний снапшот без блокировок. Устарел максимум на интервал
+// обновления.
 func (s *Snapshotter) Get(pollID uuid.UUID) (*Snapshot, bool) {
-	// TODO
-	return nil, false
+	snap, ok := (*s.current.Load())[pollID]
+	return snap, ok
 }
+
+// All возвращает все текущие снапшоты — нужен переносу в Postgres.
+func (s *Snapshotter) All() map[uuid.UUID]*Snapshot { return *s.current.Load() }

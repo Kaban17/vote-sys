@@ -105,6 +105,24 @@ func (c *Cache) rememberMiss(id uuid.UUID) {
 	c.missedAt[id] = time.Now()
 }
 
+// TrackedIDs возвращает опросы, закончившиеся позже указанного момента.
+//
+// Реализует results.Tracker. Граница сдвинута в прошлое вызывающим: после
+// ends_at агрегаты нужно собирать ещё некоторое время, пока долетают последние
+// батчи со всех инстансов.
+func (c *Cache) TrackedIDs(after time.Time) []uuid.UUID {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	ids := make([]uuid.UUID, 0, len(c.byID))
+	for id, p := range c.byID {
+		if p.EndsAt.After(after) {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
 // Warm загружает опросы, которые ещё не закончились, до начала приёма трафика.
 //
 // Инстанс обязан выйти на пик прогретым: реагировать во время

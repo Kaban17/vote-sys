@@ -2,10 +2,21 @@ package results
 
 import (
 	"context"
+	"log/slog"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/google/uuid"
 )
+
+// Store — запись агрегатов в долговременное хранилище.
+//
+// Номер прогона (generation) сюда не передаётся: хранилище читает его само, в
+// той же команде, из единственного источника истины. Передавать его отсюда
+// означало бы полагаться на процессный кэш, который считает опрос неизменяемым,
+// — а generation ровно та его часть, которая меняется (architecture.md §5.7).
+type Store interface {
+	SaveResults(ctx context.Context, pollID uuid.UUID, votes map[uuid.UUID]int64, voters int64) error
+}
 
 // Persister переносит снапшоты из Redis в Postgres.
 //
@@ -13,49 +24,40 @@ import (
 // безопасна. Благодаря этому любой инстанс может писать снапшот: выборы лидера,
 // распределённые блокировки и выделенный воркер не нужны (architecture.md §5.7).
 type Persister struct {
-	db    *pgxpool.Pool
+	store Store
 	snaps *Snapshotter
 	every time.Duration
+	log   *slog.Logger
 }
 
-func NewPersister(db *pgxpool.Pool, snaps *Snapshotter, every time.Duration) *Persister {
-	return &Persister{db: db, snaps: snaps, every: every}
+func NewPersister(store Store, snaps *Snapshotter, every time.Duration, log *slog.Logger) *Persister {
+	return &Persister{store: store, snaps: snaps, every: every, log: log}
 }
 
-func (p *Persister) Run(ctx context.Context) error {
-	// TODO: тикер → upsert по всем активным опросам.
-	return nil
+func (p *Persister) Run(ctx context.Context) {
+	t := time.NewTicker(p.every)
+	defer t.Stop()
+
+	for {
+		select {
+		case <-t.C:
+			p.Persist(ctx)
+		case <-ctx.Done():
+			// Финальный перенос: последние секунды события — самые важные, и
+			// терять их из-за незакрытого интервала не хочется.
+			p.Persist(context.WithoutCancel(ctx))
+			return
+		}
+	}
 }
 
-// upsertResults — идемпотентный upsert (architecture.md §5.7).
-//
-// GREATEST защищает от отката, если два инстанса принесут снапшоты разной
-// свежести. Он же делает счётчик принципиально неспособным уменьшаться — отсюда
-// generation: при большей генерации значение перезаписывается безусловно.
-//
-// Это не отладочный костыль. Тот же механизм — единственный корректный способ
-// пережить потерю Redis в середине опроса: счётчики обнулились, отсчёт пошёл
-// заново, и без generation GREATEST навсегда заморозил бы докризисные цифры.
-const upsertResults = `
-INSERT INTO poll_results (poll_id, option_id, votes, generation)
-VALUES ($1, $2, $3, $4)
-ON CONFLICT (poll_id, option_id) DO UPDATE SET
-  votes = CASE
-    WHEN EXCLUDED.generation > poll_results.generation THEN EXCLUDED.votes
-    ELSE GREATEST(poll_results.votes, EXCLUDED.votes)
-  END,
-  generation = GREATEST(poll_results.generation, EXCLUDED.generation),
-  updated_at = now()
-`
-
-const upsertTotals = `
-INSERT INTO poll_totals (poll_id, voters, generation)
-VALUES ($1, $2, $3)
-ON CONFLICT (poll_id) DO UPDATE SET
-  voters = CASE
-    WHEN EXCLUDED.generation > poll_totals.generation THEN EXCLUDED.voters
-    ELSE GREATEST(poll_totals.voters, EXCLUDED.voters)
-  END,
-  generation = GREATEST(poll_totals.generation, EXCLUDED.generation),
-  updated_at = now()
-`
+func (p *Persister) Persist(ctx context.Context) {
+	for id, snap := range p.snaps.All() {
+		if snap.Voters == 0 && len(snap.Votes) == 0 {
+			continue
+		}
+		if err := p.store.SaveResults(ctx, id, snap.Votes, snap.Voters); err != nil {
+			p.log.Error("не удалось сохранить агрегаты", "poll_id", id, "err", err)
+		}
+	}
+}

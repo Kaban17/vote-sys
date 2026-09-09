@@ -279,6 +279,91 @@ type Aggregate struct {
 }
 
 func (s *Store) Results(ctx context.Context, pollID uuid.UUID) (*Aggregate, error) {
-	// TODO(шаг 6): чтение poll_results и poll_totals.
-	return nil, errors.New("не реализовано: шаг 6")
+	agg := &Aggregate{Votes: make(map[uuid.UUID]int64)}
+
+	rows, err := s.db.Query(ctx, `SELECT option_id, votes FROM poll_results WHERE poll_id = $1`, pollID)
+	if err != nil {
+		return nil, fmt.Errorf("чтение агрегатов: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var optID uuid.UUID
+		var n int64
+		if err := rows.Scan(&optID, &n); err != nil {
+			return nil, fmt.Errorf("разбор агрегата: %w", err)
+		}
+		agg.Votes[optID] = n
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("чтение агрегатов: %w", err)
+	}
+
+	err = s.db.QueryRow(ctx, `SELECT voters FROM poll_totals WHERE poll_id = $1`, pollID).Scan(&agg.Voters)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("чтение числа участников: %w", err)
+	}
+	return agg, nil
 }
+
+// SaveResults — идемпотентный перенос снапшота (architecture.md §5.7).
+//
+// Значение абсолютное, а не дельта, поэтому повторная запись безопасна и любой
+// инстанс может её сделать без выборов лидера.
+//
+// GREATEST защищает от отката, если два инстанса принесут снапшоты разной
+// свежести. Он же делает счётчик неспособным уменьшаться — отсюда generation:
+// при большей генерации значение перезаписывается безусловно. Это не отладочный
+// костыль, а единственный корректный способ пережить потерю Redis в середине
+// опроса: счётчики обнулились, отсчёт пошёл заново, и без генерации GREATEST
+// навсегда заморозил бы докризисные цифры.
+//
+// Генерация НЕ передаётся аргументом, а читается подзапросом из polls в той же
+// команде. Первая версия брала её из процессного кэша, и escape hatch не
+// работал: кэш считает опрос неизменяемым, а generation — ровно та его часть,
+// которая меняется. После сброса состояния в polls стояла двойка, инстанс писал
+// единицу, и GREATEST сохранял докризисные цифры навсегда. Чтение из
+// единственного источника истины атомарно с записью убирает этот класс ошибок
+// целиком.
+func (s *Store) SaveResults(ctx context.Context, pollID uuid.UUID, votes map[uuid.UUID]int64, voters int64) error {
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("начало транзакции: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	batch := &pgx.Batch{}
+	for optID, n := range votes {
+		batch.Queue(upsertResults, pollID, optID, n)
+	}
+	batch.Queue(upsertTotals, pollID, voters)
+	if err := tx.SendBatch(ctx, batch).Close(); err != nil {
+		return fmt.Errorf("запись агрегатов: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("коммит агрегатов: %w", err)
+	}
+	return nil
+}
+
+const upsertResults = `
+INSERT INTO poll_results (poll_id, option_id, votes, generation)
+SELECT $1, $2, $3, p.generation FROM polls p WHERE p.id = $1
+ON CONFLICT (poll_id, option_id) DO UPDATE SET
+  votes = CASE
+    WHEN EXCLUDED.generation > poll_results.generation THEN EXCLUDED.votes
+    ELSE GREATEST(poll_results.votes, EXCLUDED.votes)
+  END,
+  generation = GREATEST(poll_results.generation, EXCLUDED.generation),
+  updated_at = now()`
+
+const upsertTotals = `
+INSERT INTO poll_totals (poll_id, voters, generation)
+SELECT $1, $2, p.generation FROM polls p WHERE p.id = $1
+ON CONFLICT (poll_id) DO UPDATE SET
+  voters = CASE
+    WHEN EXCLUDED.generation > poll_totals.generation THEN EXCLUDED.voters
+    ELSE GREATEST(poll_totals.voters, EXCLUDED.voters)
+  END,
+  generation = GREATEST(poll_totals.generation, EXCLUDED.generation),
+  updated_at = now()`

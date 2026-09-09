@@ -33,6 +33,16 @@ seed: ## Создать демо-опрос через админский API
 load: ## Нагрузочный тест (см. cmd/loadgen)
 	go run ./cmd/loadgen -target http://localhost:8080 -rps 5000 -duration 60s
 
-reset: ## Сбросить Redis и поднять generation опросов (architecture.md §5.7)
+reset: ## Сбросить Redis, поднять generation и перезапустить инстансы (architecture.md §5.7)
+	# Порядок шагов существенен, а не косметичен.
+	#
+	# 1. Очистить счётчики.
+	# 2. Перезапустить инстансы — они держат снапшоты предыдущего прогона.
+	# 3. И только теперь поднять generation.
+	#
+	# Если поднять номер до рестарта, живой инстанс успеет записать устаревший
+	# снапшот уже с новым номером, то есть израсходует бамп впустую: следующая
+	# запись упрётся в GREATEST при равных номерах, и цифра застрянет навсегда.
 	docker compose exec -T redis redis-cli FLUSHALL
+	docker compose restart api1 api2 api3
 	docker compose exec -T postgres psql -U vote -d vote -c "UPDATE polls SET generation = generation + 1;"

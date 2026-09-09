@@ -93,7 +93,74 @@ func (s *Server) handleGetPoll(w http.ResponseWriter, r *http.Request) {
 // миллионов. Вторая волна трафика приходит именно сюда, синхронно по таймеру
 // у всех зрителей.
 func (s *Server) handlePublicResults(w http.ResponseWriter, r *http.Request) {
-	notImplemented(w, "шаг 6")
+	id, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		w.Header().Set("Cache-Control", "no-store")
+		writeError(w, http.StatusBadRequest, "bad_request", "id: ожидается uuid")
+		return
+	}
+
+	p, err := s.cache.Get(r.Context(), id)
+	if err != nil {
+		w.Header().Set("Cache-Control", "no-store")
+		if errors.Is(err, poll.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "not_found", "опрос не найден")
+			return
+		}
+		s.logger.Error("не удалось загрузить опрос", "poll_id", id, "err", err)
+		writeError(w, http.StatusInternalServerError, "internal", "внутренняя ошибка")
+		return
+	}
+
+	now := time.Now()
+	if p.StateAt(now) != poll.StateClosed {
+		// Промежуточные результаты не показываются: показ лидера во время
+		// голосования создаёт bandwagon effect, а для национальной компании по
+		// проведению опросов это методологический дефект (architecture.md §5.2).
+		w.Header().Set("Cache-Control", "no-store")
+		writeError(w, http.StatusTooEarly, "not_finished", "результаты будут доступны после завершения")
+		return
+	}
+
+	// Two-phase кэширование (architecture.md §3). Пока досходятся последние
+	// батчи — короткий TTL со stale-while-revalidate; дальше результат
+	// неизменяем и кэшируется как статика. Именно тогда приходит основная волна
+	// читателей: у всех зрителей таймер истекает в одну и ту же секунду.
+	if now.Before(p.EndsAt.Add(s.cfg.VoteGracePeriod + resultsSettle)) {
+		w.Header().Set("Cache-Control", "public, max-age=5, stale-while-revalidate=30")
+	} else {
+		w.Header().Set("Cache-Control", "public, max-age=3600, immutable")
+	}
+
+	res := s.resultsOf(r.Context(), p)
+	out := publicResults{PollID: res.PollID, Question: p.Question, Voters: res.Voters}
+	out.Results = make([]publicOptionCount, len(res.Results))
+	for i, r := range res.Results {
+		out.Results[i] = publicOptionCount{Text: r.Text, Votes: r.Votes, Percent: r.Percent}
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// resultsSettle — сколько после окончания приёма голосов результат ещё считается
+// неокончательным.
+//
+// За это время досходятся последние батчи со всех инстансов и отрабатывает
+// финальный flush при остановке. Дальше цифра не меняется никогда.
+const resultsSettle = 30 * time.Second
+
+// publicResults — то же, что видит админка, но без идентификаторов вариантов:
+// зрителю они не нужны, а меньше полей — меньше поверхности.
+type publicResults struct {
+	PollID   string              `json:"poll_id"`
+	Question string              `json:"question"`
+	Voters   int64               `json:"voters"`
+	Results  []publicOptionCount `json:"results"`
+}
+
+type publicOptionCount struct {
+	Text    string  `json:"text"`
+	Votes   int64   `json:"votes"`
+	Percent float64 `json:"percent"`
 }
 
 // handleHealth — readiness, а не liveness.

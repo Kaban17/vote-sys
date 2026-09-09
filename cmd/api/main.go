@@ -21,6 +21,7 @@ import (
 	"github.com/boar/vote-sys/internal/httpapi"
 	"github.com/boar/vote-sys/internal/platform"
 	"github.com/boar/vote-sys/internal/poll"
+	"github.com/boar/vote-sys/internal/results"
 	"github.com/boar/vote-sys/internal/token"
 	"github.com/boar/vote-sys/internal/vote"
 )
@@ -36,6 +37,13 @@ func main() {
 		os.Exit(1)
 	}
 }
+
+// resultsSettleWindow — сколько после конца опроса ещё собирать агрегаты.
+//
+// За это время долетают последние батчи со всех инстансов. Значение должно быть
+// не меньше того, что использует публичный эндпоинт результатов при выборе
+// заголовков кэширования.
+const resultsSettleWindow = 2 * time.Minute
 
 func run(levelVar *slog.LevelVar) error {
 	// Сигнал прерывает прогрев тоже: под оркестратором инстанс могут снять и до
@@ -110,14 +118,31 @@ func run(levelVar *slog.LevelVar) error {
 	})
 	checker := dedup.NewGuardedChecker(dedup.NewRedisStore(rdb), cfg.DedupTimeout, br)
 
-	// TODO(шаг 6): snapshotter.Run, persister.Run.
+	// 5. Читающее зеркало батчера: Redis → память раз в секунду, память →
+	//    Postgres раз в пять секунд. Ни один запрос к результатам не идёт в
+	//    Redis напрямую (architecture.md §5.2).
+	snapshots := results.NewSnapshotter(
+		results.NewRedisSource(rdb, cfg.SnapshotInterval),
+		cache, cfg.CounterShards, cfg.SnapshotInterval, resultsSettleWindow, slog.Default(),
+	)
+	persister := results.NewPersister(store, snapshots, cfg.PersistInterval, slog.Default())
+
+	readersCtx, stopReaders := context.WithCancel(context.Background())
+	defer stopReaders()
+	persisterDone := make(chan struct{})
+	go snapshots.Run(readersCtx)
+	go func() {
+		defer close(persisterDone)
+		persister.Run(readersCtx)
+	}()
 
 	srv := httpapi.NewServer(cfg, httpapi.Deps{
-		Polls:   store,
-		Cache:   cache,
-		Tokens:  token.NewIssuer(cfg.TokenHMACSecret, cfg.TokenTTL),
-		Batcher: batcher,
-		Dedup:   checker,
+		Polls:     store,
+		Cache:     cache,
+		Tokens:    token.NewIssuer(cfg.TokenHMACSecret, cfg.TokenTTL),
+		Batcher:   batcher,
+		Dedup:     checker,
+		Snapshots: snapshots,
 	})
 
 	// Агрегат трафика по ручкам. Заменяет построчный лог на горячем пути:
@@ -177,6 +202,17 @@ func run(levelVar *slog.LevelVar) error {
 			stopBatcher()
 			select {
 			case <-batcherDone:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			return nil
+		},
+		// Перенос агрегатов останавливается ПОСЛЕ финального flush батчера:
+		// иначе последняя порция голосов дойдёт до Redis, но не до Postgres.
+		func(ctx context.Context) error {
+			stopReaders()
+			select {
+			case <-persisterDone:
 			case <-ctx.Done():
 				return ctx.Err()
 			}
