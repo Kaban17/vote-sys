@@ -163,24 +163,44 @@ func (s *Server) handleAdminResults(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.resultsOf(r.Context(), p))
 }
 
-// resultsOf собирает ответ из снапшота в памяти, а при его отсутствии — из
-// Postgres.
+// resultsOf собирает ответ, беря поштучный максимум снапшота и Postgres.
 //
-// Снапшот первичен: он свежее (обновляется раз в секунду против пяти) и не
-// требует запроса в базу. Postgres нужен для опросов, выпавших из окна
-// отслеживания, — например, закончившихся вчера.
+// Снапшот свежее — раз в секунду против пяти, — но после потери Redis он
+// оказывается НИЖЕ сохранённого: счётчики начали отсчёт заново. Отдавать его
+// безусловно значит показывать оператору, как результат едет назад, — ровно то,
+// от чего GREATEST защищает хранилище (architecture.md §5.7). Замерено на
+// стенде: после двадцатисекундного отказа Redis в Postgres было 17246, в
+// снапшоте 12386, и админка показывала меньшее.
+//
+// Максимум не «замораживает» цифру при осознанном сбросе: сброс поднимает
+// generation, и upsert перезаписывает Postgres новым, меньшим значением
+// безусловно — так что максимум берётся уже из двух актуальных источников.
 func (s *Server) resultsOf(ctx context.Context, p *poll.Poll) adminResultsResponse {
 	var (
-		votes  map[uuid.UUID]int64
+		votes  = make(map[uuid.UUID]int64, len(p.Options))
 		voters int64
-		stale  int64
+		stale  int64 = -1 // -1 означает «снапшота нет, данные только из Postgres»
 	)
 
+	if agg, err := s.polls.Results(ctx, p.ID); err == nil {
+		for id, n := range agg.Votes {
+			votes[id] = n
+		}
+		voters = agg.Voters
+	} else {
+		s.logger.Error("не удалось прочитать агрегаты из Postgres", "poll_id", p.ID, "err", err)
+	}
+
 	if snap, ok := s.snapshots.Get(p.ID); ok {
-		votes, voters = snap.Votes, snap.Voters
+		for id, n := range snap.Votes {
+			if n > votes[id] {
+				votes[id] = n
+			}
+		}
+		if snap.Voters > voters {
+			voters = snap.Voters
+		}
 		stale = time.Since(snap.TakenAt).Milliseconds()
-	} else if agg, err := s.polls.Results(ctx, p.ID); err == nil {
-		votes, voters = agg.Votes, agg.Voters
 	}
 
 	out := adminResultsResponse{

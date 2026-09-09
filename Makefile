@@ -30,8 +30,13 @@ migrate: ## Применить миграции (идемпотентно; пр�
 seed: ## Создать демо-опрос через админский API
 	./scripts/seed.sh
 
-load: ## Нагрузочный тест (см. cmd/loadgen)
-	go run ./cmd/loadgen -target http://localhost:8080 -rps 5000 -duration 60s
+load: ## Нагрузочный тест: профиль ТВ-эфира (см. cmd/loadgen)
+	# Порт 8081 — вход без rate limit: лимит считается по IP, а генератор бьёт
+	# с одного адреса, и без этого замер показывал бы работу лимитера.
+	go run ./cmd/loadgen -target http://localhost:8081 -rps $(RPS) -duration $(DURATION) -csv bench/load-baseline.csv
+
+RPS ?= 500
+DURATION ?= 60s
 
 reset: ## Сбросить Redis, поднять generation и перезапустить инстансы (architecture.md §5.7)
 	# Порядок шагов существенен, а не косметичен.

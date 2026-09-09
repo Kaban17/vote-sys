@@ -69,6 +69,8 @@ services:
     image: nginx:1.27-alpine
     ports:
       - "8080:80"
+      # Нагрузочный вход без rate limit — только для стенда, см. nginx.conf.
+      - "8081:81"
     volumes:
       - ./deploy/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./web:/var/www/web:ro
