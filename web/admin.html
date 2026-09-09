@@ -50,11 +50,23 @@
     button.ghost { background: transparent; color: var(--accent); border: 1px solid var(--line); font-weight: 500; }
     .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; }
     .row > * { flex: 1 1 160px; }
-    .poll {
-      border-top: 1px solid var(--line); padding: 12px 0;
-      display: flex; gap: 12px; justify-content: space-between; align-items: flex-start;
+    details.poll { border-top: 1px solid var(--line); }
+    details.poll:first-child { border-top: 0; }
+    details.poll > summary {
+      padding: 12px 0; cursor: pointer; list-style: none;
+      display: flex; gap: 12px; align-items: flex-start;
     }
-    .poll:first-child { border-top: 0; }
+    details.poll > summary::-webkit-details-marker { display: none; }
+    /* Треугольник рисуем сами: у нативного маркера нет управления цветом,
+       и он по-разному выглядит в браузерах. */
+    details.poll > summary::before {
+      content: "▸"; color: var(--muted); flex: 0 0 auto;
+      transition: transform .12s ease; line-height: 1.6;
+    }
+    details.poll[open] > summary::before { transform: rotate(90deg); }
+    details.poll > summary:hover { color: var(--accent); }
+    .poll-body { padding: 4px 0 16px 20px; }
+    .poll-title { flex: 1 1 auto; }
     .meta { color: var(--muted); font-size: 13px; }
     .badge {
       display: inline-block; padding: 1px 8px; border-radius: 999px;
@@ -126,11 +138,6 @@
     <div id="list" class="meta">—</div>
   </div>
 
-  <div class="card hidden" id="resultsCard">
-    <h2>Результаты <span id="resultsFor" class="meta"></span></h2>
-    <div id="results"></div>
-    <div id="stale" class="meta"></div>
-  </div>
 </main>
 
 <script>
@@ -141,8 +148,12 @@
   var token = localStorage.getItem("admin_token") || "";
   $("token").value = token;
 
-  var watching = null;
-  var timer = null;
+  // Раскрытые опросы. Хранятся отдельно от DOM, чтобы обновление списка не
+  // схлопывало то, что оператор сейчас читает.
+  var expanded = new Set();
+  // id → узлы строки. Список обновляется НА МЕСТЕ: перерисовка целиком
+  // заставляла бы открытый блок мигать раз в секунду.
+  var rows = new Map();
 
   function auth() { return { "Authorization": "Bearer " + token }; }
 
@@ -190,71 +201,135 @@
     }).then(function (p) {
       $("created").innerHTML = '<span class="ok">Создан.</span> Ссылка для зрителя: ' +
         '<a href="/p/' + p.id + '" target="_blank">/p/' + p.id + '</a>';
+      expanded.add(p.id); // созданный опрос сразу раскрыт: за ним и будут смотреть
       load();
-      watch(p.id);
     }).catch(function (e) {
-      $("created").innerHTML = '<span class="err">' + e.message + "</span>";
+      $("created").innerHTML = '<span class="err">' + escapeHtml(e.message) + "</span>";
     });
   });
 
   function load() {
     if (!token) { $("auth").innerHTML = '<span class="err">Укажите токен</span>'; return; }
-    api("/api/admin/polls").then(function (data) {
+    // Ограничение осмысленное, а не косметическое: опросов накапливается много,
+    // а оператору нужны последние — список отсортирован по created_at DESC.
+    api("/api/admin/polls?limit=20").then(function (data) {
       $("auth").innerHTML = '<span class="ok">Токен принят</span>';
-      var polls = data.polls || [];
-      if (!polls.length) { $("list").textContent = "Опросов пока нет"; return; }
-
-      $("list").innerHTML = "";
-      polls.forEach(function (p) {
-        var d = document.createElement("div");
-        d.className = "poll";
-        d.innerHTML =
-          '<div><div>' + escapeHtml(p.question) + '</div>' +
-          '<div class="meta"><span class="badge">' + p.state + '</span> ' +
-          p.kind + ' · до ' + new Date(p.ends_at).toLocaleTimeString() +
-          ' · gen ' + p.generation + '<br><code>' + p.id + '</code></div></div>';
-        var b = document.createElement("button");
-        b.className = "ghost";
-        b.textContent = "Результаты";
-        b.addEventListener("click", function () { watch(p.id); });
-        d.appendChild(b);
-        $("list").appendChild(d);
-      });
+      sync(data.polls || []);
     }).catch(function (e) {
-      $("auth").innerHTML = '<span class="err">' + e.message + "</span>";
+      $("auth").innerHTML = '<span class="err">' + escapeHtml(e.message) + "</span>";
     });
   }
 
-  function watch(id) {
-    watching = id;
-    $("resultsCard").classList.remove("hidden");
-    $("resultsFor").innerHTML = "<code>" + id + "</code>";
-    if (timer) clearInterval(timer);
-    refresh();
-    timer = setInterval(refresh, 1000);
+  // sync приводит список в соответствие с ответом, не трогая уже отрисованное:
+  // существующие строки обновляются, исчезнувшие удаляются, новые добавляются.
+  function sync(polls) {
+    if (!polls.length) {
+      $("list").textContent = "Опросов пока нет";
+      rows.clear();
+      return;
+    }
+    if (rows.size === 0) $("list").innerHTML = "";
+
+    var seen = new Set();
+    polls.forEach(function (p) {
+      seen.add(p.id);
+      var row = rows.get(p.id);
+      if (!row) {
+        row = buildRow(p);
+        rows.set(p.id, row);
+        $("list").appendChild(row.details);
+      }
+      row.meta.innerHTML = metaHTML(p);
+    });
+
+    rows.forEach(function (row, id) {
+      if (!seen.has(id)) {
+        row.details.remove();
+        rows.delete(id);
+        expanded.delete(id);
+      }
+    });
   }
 
-  function refresh() {
-    if (!watching) return;
-    api("/api/admin/polls/" + watching + "/results").then(function (r) {
-      $("results").innerHTML = "";
+  function metaHTML(p) {
+    return '<span class="badge">' + p.state + "</span> " + p.kind +
+      " · до " + new Date(p.ends_at).toLocaleTimeString() +
+      " · gen " + p.generation +
+      '<br><code>' + p.id + "</code>";
+  }
+
+  function buildRow(p) {
+    var details = document.createElement("details");
+    details.className = "poll";
+    details.open = expanded.has(p.id);
+
+    var summary = document.createElement("summary");
+    var title = document.createElement("div");
+    title.className = "poll-title";
+
+    var q = document.createElement("div");
+    q.textContent = p.question;
+
+    var meta = document.createElement("div");
+    meta.className = "meta";
+    meta.innerHTML = metaHTML(p);
+
+    title.appendChild(q);
+    title.appendChild(meta);
+    summary.appendChild(title);
+
+    var body = document.createElement("div");
+    body.className = "poll-body meta";
+    body.textContent = "загрузка…";
+
+    details.appendChild(summary);
+    details.appendChild(body);
+
+    details.addEventListener("toggle", function () {
+      if (details.open) {
+        expanded.add(p.id);
+        refreshOne(p.id, body);
+      } else {
+        expanded.delete(p.id);
+      }
+    });
+    if (details.open) refreshOne(p.id, body);
+
+    return { details: details, meta: meta, body: body };
+  }
+
+  function refreshOne(id, body) {
+    api("/api/admin/polls/" + id + "/results").then(function (r) {
+      body.innerHTML = "";
+
       r.results.forEach(function (o) {
         var el = document.createElement("div");
         el.className = "opt";
         el.innerHTML =
-          '<div class="top"><span>' + escapeHtml(o.text) + '</span>' +
-          '<span class="mono">' + o.votes + ' · ' + o.percent.toFixed(1) + '%</span></div>' +
+          '<div class="top"><span>' + escapeHtml(o.text) + "</span>" +
+          '<span class="mono">' + o.votes + " · " + o.percent.toFixed(1) + "%</span></div>" +
           '<div class="bar"><i style="width:' + Math.min(100, o.percent) + '%"></i></div>';
-        $("results").appendChild(el);
+        body.appendChild(el);
       });
+
+      var foot = document.createElement("div");
       // Проценты считаются от числа проголосовавших, а не от суммы голосов: при
       // multiple один зритель увеличивает несколько счётчиков, и сумма
       // процентов законно превысит 100 (architecture.md §5.8).
-      $("stale").textContent =
-        "Проголосовало: " + r.voters +
-        " · данные отстают на " + r.stale_for_ms + " мс";
+      foot.textContent = "Проголосовало: " + r.voters +
+        (r.stale_for_ms >= 0
+          ? " · данные отстают на " + r.stale_for_ms + " мс"
+          : " · из Postgres, снапшота нет");
+      body.appendChild(foot);
     }).catch(function (e) {
-      $("stale").innerHTML = '<span class="err">' + e.message + "</span>";
+      body.innerHTML = '<span class="err">' + escapeHtml(e.message) + "</span>";
+    });
+  }
+
+  // Обновляются только раскрытые опросы: закрытые не стоят ни запроса.
+  function refreshExpanded() {
+    rows.forEach(function (row, id) {
+      if (expanded.has(id)) refreshOne(id, row.body);
     });
   }
 
@@ -265,6 +340,10 @@
   }
 
   load();
+  setInterval(refreshExpanded, 1000);
+  // Список реже: меняются только состояние и generation, а перерисовка мешает
+  // читать раскрытые результаты.
+  setInterval(load, 5000);
 })();
 </script>
 </body>
