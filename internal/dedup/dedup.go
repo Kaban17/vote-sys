@@ -36,10 +36,26 @@ const (
 	Bypassed
 )
 
-// Checker — проверка и пометка токена одной атомарной операцией.
+func (r Result) String() string {
+	switch r {
+	case First:
+		return "first"
+	case Duplicate:
+		return "duplicate"
+	default:
+		return "bypassed"
+	}
+}
+
+// Checker — проверка и пометка голосующего одной атомарной операцией.
 type Checker interface {
-	// Check выполняет SET NX EX dedup:{pollID}:{token}.
+	// Check выполняет SET NX EX dedup:{pollID}:{voterID}.
+	//
+	// voterID — случайная часть подписанного токена, а не токен целиком: при
+	// 10 млн ключей каждый лишний символ в имени стоит около 10 МБ Redis
+	// (см. token.VoterID).
+	//
 	// Никогда не возвращает ошибку: недоступность выражается через Bypassed,
 	// потому что вызывающий всё равно обязан принять голос.
-	Check(ctx context.Context, pollID uuid.UUID, token string, ttl time.Duration) Result
+	Check(ctx context.Context, pollID uuid.UUID, voterID string, ttl time.Duration) Result
 }

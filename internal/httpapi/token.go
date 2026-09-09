@@ -1,6 +1,18 @@
 package httpapi
 
-import "net/http"
+import (
+	"encoding/json"
+	"net/http"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/boar/vote-sys/internal/token"
+)
+
+type tokenRequest struct {
+	PollID string `json:"poll_id"`
+}
 
 // handleToken выпускает анонимный токен и ставит его кукой.
 //
@@ -20,15 +32,48 @@ import "net/http"
 // Поэтому защита перенесена из конфигурации в структуру: POST не кэшируется ни
 // одним CDN по спецификации HTTP. Нет заголовка, который включил бы ошибку, и
 // нет page rule, который бы её создал — она невыразима.
+//
+// Существование опроса здесь НЕ проверяется, и это намеренно. Эндпоинт обязан
+// оставаться свободным от обращений к хранилищам: он самый дешёвый в системе и
+// первый кандидат на переезд в edge compute. Токен для несуществующего опроса
+// бесполезен — /vote всё равно проверит опрос сам.
 func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
-	// TODO:
-	//   pollID из тела/query → issuer.Issue(pollID, now)
-	//   http.SetCookie(w, &http.Cookie{
-	//       Name: token.CookieName, Value: tok,
-	//       Path: "/", HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode,
-	//       MaxAge: int(ttl.Seconds()),
-	//   })
-	//   w.Header().Set("Cache-Control", "no-store")
-	//   204
-	notImplemented(w, "шаг 3")
+	// no-store здесь дублирует структурную защиту. Дублирование осознанное:
+	// заголовок дешёв, а цена ошибки — весь опрос.
+	w.Header().Set("Cache-Control", "no-store")
+
+	var req tokenRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_json", "не разобрать тело запроса")
+		return
+	}
+
+	pollID, err := uuid.Parse(req.PollID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "poll_id: ожидается uuid")
+		return
+	}
+
+	tok, err := s.tokens.Issue(pollID, time.Now())
+	if err != nil {
+		s.logger.Error("не удалось выпустить токен", "err", err)
+		writeError(w, http.StatusInternalServerError, "internal", "внутренняя ошибка")
+		return
+	}
+
+	http.SetCookie(w, &http.Cookie{
+		Name:  token.CookieName,
+		Value: tok,
+		Path:  "/",
+		// HttpOnly: скрипту лендинга токен не нужен, браузер отправит куку сам.
+		HttpOnly: true,
+		// Secure обязателен в проде. На локальном стенде по HTTP браузер такую
+		// куку не примет, поэтому флаг вынесен в конфигурацию.
+		Secure: s.cfg.CookieSecure,
+		// Lax достаточно: голосование идёт с того же origin, что и лендинг.
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   int(s.cfg.TokenTTL.Seconds()),
+	})
+
+	w.WriteHeader(http.StatusNoContent)
 }

@@ -15,9 +15,14 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/boar/vote-sys/internal/breaker"
 	"github.com/boar/vote-sys/internal/config"
+	"github.com/boar/vote-sys/internal/dedup"
 	"github.com/boar/vote-sys/internal/httpapi"
 	"github.com/boar/vote-sys/internal/platform"
+	"github.com/boar/vote-sys/internal/poll"
+	"github.com/boar/vote-sys/internal/token"
+	"github.com/boar/vote-sys/internal/vote"
 )
 
 func main() {
@@ -56,7 +61,7 @@ func run(levelVar *slog.LevelVar) error {
 	}
 	defer db.Close()
 
-	rdb, err := platform.NewRedis(ctx, cfg.RedisAddr, cfg.RedisPoolSize)
+	rdb, err := platform.NewRedis(ctx, cfg.RedisAddr, cfg.RedisPoolSize, cfg.DedupTimeout)
 	if err != nil {
 		return err
 	}
@@ -68,10 +73,52 @@ func run(levelVar *slog.LevelVar) error {
 		"shard", cfg.Shard(),
 	)
 
-	// TODO(шаг 2): poll.Cache.Warm — метаданные armed-опросов в память ДО эфира.
-	// TODO(шаги 4-6): batcher.Run, snapshotter.Run, persister.Run.
+	// 2. Метаданные ещё не закончившихся опросов — в память ДО эфира.
+	store := poll.NewStore(db)
+	cache := poll.NewCache(store)
+	warmed, err := cache.Warm(ctx)
+	if err != nil {
+		return err
+	}
+	slog.Info("кэш опросов прогрет", "polls", warmed)
 
-	srv := httpapi.NewServer(cfg)
+	// 3. Батчер: 250K инкрементов в секунду в памяти → ~1000 ops/sec в Redis.
+	sink := vote.NewRedisSink(rdb, cfg.FlushInterval)
+	batcher := vote.NewBatcher(sink, cfg.Shard(), cfg.FlushInterval, slog.Default())
+	batcherCtx, stopBatcher := context.WithCancel(context.Background())
+	// Страховка на путях раннего выхода: штатная остановка идёт из
+	// GracefulShutdown, но контекст не должен утечь, если сервер не поднялся.
+	defer stopBatcher()
+	batcherDone := make(chan struct{})
+	go func() {
+		defer close(batcherDone)
+		batcher.Run(batcherCtx)
+	}()
+
+	// 4. Дедуп: единственный синхронный round-trip на горячем пути и потолок
+	//    всей системы (architecture.md §2). Таймаут ограничивает урон от одного
+	//    запроса, breaker — системный; нужны оба (architecture.md §6).
+	br := breaker.New(breaker.Config{
+		ErrorThreshold: cfg.BreakerErrorThreshold,
+		Window:         cfg.BreakerWindow,
+		ProbeInterval:  cfg.BreakerProbeInterval,
+		OnStateChange: func(from, to breaker.State) {
+			// Событие редкое, но во время эфира — самое важное: оно означает,
+			// что дедуп перестал работать и голоса идут без проверки.
+			slog.Warn("дедуп: смена состояния цепи", "from", from.String(), "to", to.String())
+		},
+	})
+	checker := dedup.NewGuardedChecker(dedup.NewRedisStore(rdb), cfg.DedupTimeout, br)
+
+	// TODO(шаг 6): snapshotter.Run, persister.Run.
+
+	srv := httpapi.NewServer(cfg, httpapi.Deps{
+		Polls:   store,
+		Cache:   cache,
+		Tokens:  token.NewIssuer(cfg.TokenHMACSecret, cfg.TokenTTL),
+		Batcher: batcher,
+		Dedup:   checker,
+	})
 
 	// Агрегат трафика по ручкам. Заменяет построчный лог на горячем пути:
 	// одна строка на ручку за интервал вместо сотен тысяч
@@ -122,9 +169,19 @@ func run(levelVar *slog.LevelVar) error {
 	srv.MarkUnready()
 	slog.Info("остановка", "timeout", cfg.ShutdownTimeout)
 
-	// TODO(шаг 4): передать сюда batcher.Flush — финальный сброс батча, то, что
-	// превращает плановый рестарт в нулевую потерю голосов (architecture.md §5.4).
 	err = platform.GracefulShutdown(ctx, httpSrv, cfg.ShutdownTimeout,
+		// Финальный flush батчера — то, что превращает плановый рестарт в
+		// НУЛЕВУЮ потерю голосов (architecture.md §5.4). Идёт после остановки
+		// приёма, иначе счётчики тут же пополнят незавершённые хендлеры.
+		func(ctx context.Context) error {
+			stopBatcher()
+			select {
+			case <-batcherDone:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			return nil
+		},
 		func(context.Context) error {
 			// Последний интервал почти наверняка не закрыт, а он и самый
 			// интересный: в нём остановка.

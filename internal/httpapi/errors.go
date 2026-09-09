@@ -1,9 +1,11 @@
 package httpapi
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"strings"
 )
 
 // Коды ответов на голос (architecture.md §8).
@@ -46,7 +48,29 @@ func notImplemented(w http.ResponseWriter, step string) {
 }
 
 // requireAdmin — статический bearer-токен из окружения.
+//
+// Для тестового задания достаточно; в проде здесь был бы полноценный IdP.
+// Сравнение за постоянное время: токен один на всю админку и живёт долго,
+// поэтому утечка по времени сравнения — реальный, а не теоретический канал.
 func (s *Server) requireAdmin(next http.Handler) http.Handler {
-	// TODO(шаг 2): subtle.ConstantTimeCompare с s.cfg.AdminBearerToken.
-	return next
+	want := []byte(s.cfg.AdminBearerToken)
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got, ok := bearerToken(r)
+		if !ok || subtle.ConstantTimeCompare(got, want) != 1 {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="admin"`)
+			writeError(w, http.StatusUnauthorized, "unauthorized", "нужен админский токен")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func bearerToken(r *http.Request) ([]byte, bool) {
+	const prefix = "Bearer "
+	h := r.Header.Get("Authorization")
+	if len(h) <= len(prefix) || !strings.EqualFold(h[:len(prefix)], prefix) {
+		return nil, false
+	}
+	return []byte(strings.TrimSpace(h[len(prefix):])), true
 }

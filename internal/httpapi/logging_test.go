@@ -43,7 +43,7 @@ func (c *capture) lines(msg string) []map[string]any {
 func newTestServer(t *testing.T, sampleN int) (*Server, *capture) {
 	t.Helper()
 	cap := newCapture()
-	srv := NewServer(&config.Config{CounterShards: 1, AccessLogSampleN: sampleN})
+	srv := NewServer(&config.Config{CounterShards: 1, AccessLogSampleN: sampleN}, Deps{})
 	srv.logger = cap.logger()
 	srv.MarkReady()
 	return srv, cap
@@ -215,9 +215,10 @@ func TestSummaryCountsEveryRequest(t *testing.T) {
 	if found["total"] != float64(n) {
 		t.Errorf("total = %v, ожидалось %d", found["total"], n)
 	}
-	// Заглушки отдают 501, и это должно быть видно поимённо.
-	if found["s501"] != float64(n) {
-		t.Errorf("s501 = %v, ожидалось %d", found["s501"], n)
+	// Ручка голосования без валидного uuid отвечает 400, и это должно быть
+	// видно в агрегате поимённо.
+	if found["s400"] != float64(n) {
+		t.Errorf("s400 = %v, ожидалось %d", found["s400"], n)
 	}
 }
 

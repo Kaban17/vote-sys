@@ -44,7 +44,7 @@ var routePolicy = map[string]routeClass{
 // Набор не случайный: 409, 410 и 429 на голосе — это не ошибки, а нормальные
 // исходы (повтор, опоздание, лимит), и именно их доля показывает, работает ли
 // дедуп и не режет ли rate limit живых зрителей.
-var trackedStatuses = []int{200, 204, 400, 401, 404, 409, 410, 425, 429, 500, 501, 503}
+var trackedStatuses = []int{200, 201, 204, 400, 401, 404, 409, 410, 425, 429, 500, 501, 503}
 
 var statusIndex = func() map[int]int {
 	m := make(map[int]int, len(trackedStatuses))
@@ -211,6 +211,8 @@ func statusKey(code int) string {
 	switch code {
 	case 200:
 		return "s200"
+	case 201:
+		return "s201"
 	case 204:
 		return "s204"
 	case 400:

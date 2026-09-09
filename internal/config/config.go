@@ -34,8 +34,7 @@ type Config struct {
 	BreakerWindow         time.Duration
 	BreakerProbeInterval  time.Duration
 
-	FlushInterval  time.Duration
-	FlushThreshold int64
+	FlushInterval time.Duration
 
 	SnapshotInterval time.Duration
 	PersistInterval  time.Duration
@@ -46,6 +45,11 @@ type Config struct {
 
 	TokenHMACSecret []byte
 	TokenTTL        time.Duration
+	// CookieSecure — ставить ли флаг Secure на куке токена.
+	//
+	// В проде обязателен. На локальном стенде по HTTP браузер такую куку не
+	// примет, поэтому значение вынесено в конфигурацию, а не зашито.
+	CookieSecure bool
 
 	AdminBearerToken string
 
@@ -94,15 +98,15 @@ func Load() (*Config, error) {
 		BreakerWindow:         l.duration("BREAKER_WINDOW", time.Second),
 		BreakerProbeInterval:  l.duration("BREAKER_PROBE_INTERVAL", 3*time.Second),
 
-		FlushInterval:  l.duration("FLUSH_INTERVAL", 150*time.Millisecond),
-		FlushThreshold: int64(l.integer("FLUSH_THRESHOLD", 10000)),
+		FlushInterval: l.duration("FLUSH_INTERVAL", 150*time.Millisecond),
 
 		SnapshotInterval: l.duration("SNAPSHOT_INTERVAL", time.Second),
 		PersistInterval:  l.duration("PERSIST_INTERVAL", 5*time.Second),
 
 		VoteGracePeriod: l.duration("VOTE_GRACE_PERIOD", 3*time.Second),
 
-		TokenTTL: l.duration("TOKEN_TTL", 24*time.Hour),
+		TokenTTL:     l.duration("TOKEN_TTL", 24*time.Hour),
+		CookieSecure: l.boolean("COOKIE_SECURE", true),
 
 		ShutdownTimeout: l.duration("SHUTDOWN_TIMEOUT", 10*time.Second),
 
@@ -189,6 +193,19 @@ func (l *loader) integer(key string, def int) int {
 	v, err := strconv.Atoi(raw)
 	if err != nil {
 		l.fail(key, fmt.Errorf("не число: %q", raw))
+		return def
+	}
+	return v
+}
+
+func (l *loader) boolean(key string, def bool) bool {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return def
+	}
+	v, err := strconv.ParseBool(raw)
+	if err != nil {
+		l.fail(key, fmt.Errorf("не булево значение: %q", raw))
 		return def
 	}
 	return v

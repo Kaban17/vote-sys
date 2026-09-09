@@ -1,8 +1,14 @@
 package httpapi
 
 import (
+	"errors"
 	"net/http"
 	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+
+	"github.com/boar/vote-sys/internal/poll"
 )
 
 type pollResponse struct {
@@ -32,9 +38,46 @@ type optionResponse struct {
 	Text string `json:"text"`
 }
 
+// handleGetPoll отдаёт метаданные опроса зрителю — из процессного кэша, а не из
+// Postgres: горячий путь базы не касается (architecture.md §2).
 func (s *Server) handleGetPoll(w http.ResponseWriter, r *http.Request) {
-	// TODO(шаг 4): из процессного кэша, не из Postgres.
-	notImplemented(w, "шаг 4")
+	// Метаданные меняться не могут (опрос неизменяем), но ends_at и server_time
+	// должны быть свежими у каждого зрителя, иначе таймер поедет.
+	w.Header().Set("Cache-Control", "no-store")
+
+	id, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "id: ожидается uuid")
+		return
+	}
+
+	p, err := s.cache.Get(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, poll.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "not_found", "опрос не найден")
+			return
+		}
+		s.logger.Error("не удалось загрузить опрос", "poll_id", id, "err", err)
+		writeError(w, http.StatusInternalServerError, "internal", "внутренняя ошибка")
+		return
+	}
+
+	opts := make([]optionResponse, len(p.Options))
+	for i, o := range p.Options {
+		opts[i] = optionResponse{ID: o.ID.String(), Text: o.Text}
+	}
+
+	writeJSON(w, http.StatusOK, pollResponse{
+		ID:       p.ID.String(),
+		Question: p.Question,
+		Kind:     string(p.Kind),
+		Options:  opts,
+		// ends_at БЕЗ grace period: запас применяется только к приёму, и если
+		// показать его клиенту, таймер и серверная отсечка разойдутся
+		// (architecture.md §5.5).
+		EndsAt:     p.EndsAt,
+		ServerTime: time.Now(),
+	})
 }
 
 // handlePublicResults — публичные результаты, доступны только после закрытия.

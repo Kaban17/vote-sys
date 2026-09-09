@@ -19,9 +19,10 @@ type counter struct {
 // Counters — счётчики одного опроса: массив по индексам опций плюс отдельный
 // счётчик проголосовавших.
 //
-// Массив, а не канал: канал был бы точкой сериализации, все горутины-хендлеры
-// упирались бы в одного читателя. Число опций мало и известно на старте, поэтому
-// индексация прямая и обходится без блокировок (architecture.md §5.6).
+// Массив, а не канал: канал здесь был бы точкой сериализации, все
+// горутины-хендлеры упирались бы в одного читателя. Число опций мало и известно
+// на старте, поэтому индексация прямая и обходится без блокировок
+// (architecture.md §5.6).
 //
 // voters считается отдельно от суммы: при kind = multiple один запрос
 // увеличивает несколько счётчиков, и sum(votes) перестаёт быть числом
@@ -35,10 +36,15 @@ func NewCounters(numOptions int) *Counters {
 	return &Counters{options: make([]counter, numOptions)}
 }
 
+func (c *Counters) NumOptions() int { return len(c.options) }
+
 // Add регистрирует голос: инкремент каждой выбранной опции и один инкремент
 // voters независимо от их числа.
 func (c *Counters) Add(optionIdx []int) {
-	// TODO
+	for _, i := range optionIdx {
+		c.options[i].v.Add(1)
+	}
+	c.voters.v.Add(1)
 }
 
 // Delta — снятые значения счётчиков, готовые к отправке в Redis.
@@ -47,10 +53,32 @@ type Delta struct {
 	Voters  int64
 }
 
+// IsEmpty — нечего сбрасывать.
+func (d Delta) IsEmpty() bool {
+	if d.Voters != 0 {
+		return false
+	}
+	for _, n := range d.Options {
+		if n != 0 {
+			return false
+		}
+	}
+	return true
+}
+
 // Swap атомарно забирает накопленное и обнуляет счётчики.
+//
+// Обнуление поштучное, а не одним снимком: голоса, пришедшие между Swap'ами
+// соседних опций, попадут в следующую дельту, и это правильно. Атомарность
+// нужна на уровне отдельного счётчика, а не всего набора — итог всё равно
+// суммируется в Redis.
 func (c *Counters) Swap() Delta {
-	// TODO
-	return Delta{}
+	d := Delta{Options: make([]int64, len(c.options))}
+	for i := range c.options {
+		d.Options[i] = c.options[i].v.Swap(0)
+	}
+	d.Voters = c.voters.v.Swap(0)
+	return d
 }
 
 // Restore возвращает значения обратно после неудачного flush.
@@ -59,11 +87,12 @@ func (c *Counters) Swap() Delta {
 // живом инстансе — не при падении, а просто из-за сетевой ошибки
 // (architecture.md §5.6).
 func (c *Counters) Restore(d Delta) {
-	// TODO
-}
-
-// IsEmpty — нечего сбрасывать.
-func (d Delta) IsEmpty() bool {
-	// TODO
-	return true
+	for i, n := range d.Options {
+		if n != 0 {
+			c.options[i].v.Add(n)
+		}
+	}
+	if d.Voters != 0 {
+		c.voters.v.Add(d.Voters)
+	}
 }

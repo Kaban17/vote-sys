@@ -20,7 +20,7 @@ func quiet(srv *Server) *Server {
 // него трафик, и первые секунды пика уйдут на установку соединений
 // (architecture.md §6).
 func TestHealthzGatedOnReadiness(t *testing.T) {
-	srv := quiet(NewServer(&config.Config{CounterShards: 4, InstanceOrdinal: 2, AccessLogSampleN: 1}))
+	srv := quiet(NewServer(&config.Config{CounterShards: 4, InstanceOrdinal: 2, AccessLogSampleN: 1}, Deps{}))
 	h := srv.Routes()
 
 	rec := httptest.NewRecorder()
@@ -52,18 +52,16 @@ func TestHealthzGatedOnReadiness(t *testing.T) {
 
 // Нереализованные хендлеры обязаны быть отличимы от реализованных: пустой 200
 // ввёл бы в заблуждение при первом же сквозном прогоне.
+//
+// Остались только результаты: всё прочее уже реализовано и отвечает по существу
+// (401 без админского токена, 400 на некорректный ввод).
 func TestUnimplementedHandlersReturn501(t *testing.T) {
-	srv := quiet(NewServer(&config.Config{CounterShards: 1, AccessLogSampleN: 1}))
+	srv := quiet(NewServer(&config.Config{CounterShards: 1, AccessLogSampleN: 1}, Deps{}))
 	srv.MarkReady()
 	h := srv.Routes()
 
 	cases := []struct{ method, path string }{
-		{http.MethodPost, "/api/token"},
-		{http.MethodGet, "/api/polls/x"},
-		{http.MethodPost, "/api/polls/x/vote"},
 		{http.MethodGet, "/api/polls/x/results"},
-		{http.MethodPost, "/api/admin/polls"},
-		{http.MethodGet, "/api/admin/polls"},
 	}
 	for _, c := range cases {
 		rec := httptest.NewRecorder()
