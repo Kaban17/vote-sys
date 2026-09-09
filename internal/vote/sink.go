@@ -2,7 +2,10 @@ package vote
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
+	"os"
 	"time"
 
 	"github.com/google/uuid"
@@ -16,6 +19,15 @@ import (
 // восстановление после сбоя не упёрлось в исчезнувшие ключи, но и чтобы память
 // не росла бесконечно.
 const countersTTL = 7 * 24 * time.Hour
+
+// ErrMaybeApplied — отправка не подтверждена, но команды могли выполниться.
+//
+// Различие принципиально для восстановления. HINCRBY не идемпотентен: повтор
+// дельты, которая на самом деле применилась, задваивает голоса. А двойной счёт
+// для опроса хуже потери — на этом же основании дедуп стоит до инкремента
+// (architecture.md §5.4). Поэтому при неоднозначном исходе батч выбрасывается,
+// и только при заведомо недоставленной отправке возвращается в счётчики.
+var ErrMaybeApplied = errors.New("отправка не подтверждена, дельта могла примениться")
 
 // Sink — приёмник дельт.
 //
@@ -60,7 +72,30 @@ func (s *RedisSink) Push(ctx context.Context, pollID uuid.UUID, shard int, optio
 	pipe.Expire(ctx, countsKey, countersTTL)
 	pipe.Expire(ctx, votersKey, countersTTL)
 
-	_, err := pipe.Exec(ctx)
+	if _, err := pipe.Exec(ctx); err != nil {
+		return classify(err)
+	}
+	return nil
+}
+
+// classify отличает «точно не доставлено» от «может быть, уже применилось».
+//
+// Таймаут и обрыв на чтении означают, что команды успели уйти и Redis их
+// выполнил — просто ответ не дошёл. Ошибка дозвона означает, что не ушло
+// ничего. Первое неоднозначно, второе безопасно повторить.
+func classify(err error) error {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded) {
+		return fmt.Errorf("%w: %v", ErrMaybeApplied, err)
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return fmt.Errorf("%w: %v", ErrMaybeApplied, err)
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && opErr.Op != "dial" {
+		// read/write по установленному соединению: часть команд уже могла уйти.
+		return fmt.Errorf("%w: %v", ErrMaybeApplied, err)
+	}
 	return err
 }
 

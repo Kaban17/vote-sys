@@ -2,6 +2,7 @@ package vote
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -115,8 +116,17 @@ func (b *Batcher) Flush(ctx context.Context) {
 			continue
 		}
 		if err := b.sink.Push(ctx, id, b.shard, e.optionIDs, d); err != nil {
-			// Swap уже забрал значения из памяти: без возврата они потерялись бы
-			// при полностью живом инстансе, просто из-за сетевой ошибки.
+			if errors.Is(err, ErrMaybeApplied) {
+				// Повторять нельзя: HINCRBY не идемпотентен, и если дельта всё
+				// же применилась, ретрай задвоит голоса. Двойной счёт для
+				// опроса хуже потери (architecture.md §5.4), поэтому батч
+				// выбрасывается.
+				b.log.Warn("батч выброшен: исход отправки неизвестен",
+					"poll_id", id, "voters", d.Voters, "err", err)
+				continue
+			}
+			// Отправка заведомо не дошла — возвращаем, иначе голоса потерялись
+			// бы при полностью живом инстансе.
 			e.counters.Restore(d)
 			b.log.Error("не удалось сбросить счётчики", "poll_id", id, "err", err)
 		}

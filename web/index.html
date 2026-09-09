@@ -7,36 +7,234 @@
   Токен запрашивается ОТДЕЛЬНЫМ POST-запросом из скрипта ниже. Разделение
   принципиальное: если бы кука ставилась при отдаче этой страницы, один
   закэшированный ответ раздал бы один токен всем 100 млн зрителей.
+
+  Ни одного внешнего ресурса — ни шрифтов, ни библиотек. При 100 млн открытий
+  каждый дополнительный запрос это ещё 100 млн запросов к чужому хосту, который
+  нашим нагрузочным расчётом не покрыт.
 -->
 <html lang="ru">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Голосование</title>
+  <style>
+    :root {
+      --bg: #f6f7f9; --fg: #16181d; --muted: #6b7280;
+      --card: #fff; --line: #e3e6ea; --accent: #2563eb; --accent-fg: #fff;
+      --ok: #15803d; --warn: #b45309; --err: #b91c1c;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0f1115; --fg: #e6e8ec; --muted: #9aa1ad;
+        --card: #171a20; --line: #262b33; --accent: #3b82f6; --accent-fg: #fff;
+        --ok: #4ade80; --warn: #fbbf24; --err: #f87171;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; padding: 16px;
+      font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg); color: var(--fg);
+      display: flex; justify-content: center;
+    }
+    main { width: 100%; max-width: 520px; }
+    .card {
+      background: var(--card); border: 1px solid var(--line);
+      border-radius: 14px; padding: 20px; margin-bottom: 12px;
+    }
+    h1 { font-size: 22px; line-height: 1.3; margin: 0 0 4px; }
+    .timer { font-variant-numeric: tabular-nums; color: var(--muted); font-size: 15px; }
+    .timer.urgent { color: var(--warn); font-weight: 600; }
+    /* Крупные цели нажатия: голосуют с телефона, за секунды, часто на ходу. */
+    .opt {
+      display: block; width: 100%; text-align: left;
+      padding: 16px; margin-top: 10px; min-height: 56px;
+      font: inherit; color: inherit; cursor: pointer;
+      background: var(--card); border: 2px solid var(--line); border-radius: 12px;
+    }
+    .opt[aria-pressed="true"] { border-color: var(--accent); }
+    .opt:disabled { opacity: .5; cursor: default; }
+    button.send {
+      width: 100%; margin-top: 16px; padding: 16px; min-height: 56px;
+      font: inherit; font-weight: 600; cursor: pointer;
+      background: var(--accent); color: var(--accent-fg);
+      border: 0; border-radius: 12px;
+    }
+    button.send:disabled { opacity: .45; cursor: default; }
+    .status { margin-top: 14px; font-size: 15px; }
+    .status.ok { color: var(--ok); }
+    .status.warn { color: var(--warn); }
+    .status.err { color: var(--err); }
+    .note { color: var(--muted); font-size: 13px; margin-top: 14px; }
+    .hidden { display: none; }
+  </style>
 </head>
 <body>
-  <main id="app">
-    <h1 id="question"></h1>
-    <form id="options"></form>
-    <p id="timer"></p>
-    <p id="status"></p>
+  <main>
+    <div class="card">
+      <h1 id="question">Загрузка…</h1>
+      <div class="timer" id="timer"></div>
+      <form id="form" class="hidden">
+        <div id="options"></div>
+        <button type="submit" class="send" id="send" disabled>Проголосовать</button>
+      </form>
+      <div class="status" id="status"></div>
+      <p class="note hidden" id="note"></p>
+    </div>
   </main>
 
-  <script>
-    // TODO:
-    //   1. pollID из пути /p/{id}
-    //   2. POST /api/token          → ставит куку, некэшируемо by design
-    //   3. GET  /api/polls/{id}     → вопрос, опции, ends_at, server_time
-    //   4. Таймер считается по OFFSET между server_time и Date.now(), а не по
-    //      часам устройства: на потребительских телефонах они врут на минуты,
-    //      и иначе у части зрителей кнопка погаснет на десятой секунде ролика
-    //      (architecture.md §5.5).
-    //   5. POST /api/polls/{id}/vote
-    //      200 → «голос принят»; цифр не показываем (bandwagon effect,
-    //      architecture.md §5.2)
-    //      409 → «вы уже голосовали»
-    //      410 → «голосование завершено»
-    //      429 → «слишком часто»
-  </script>
+<script>
+(function () {
+  "use strict";
+
+  var pollId = location.pathname.replace(/^\/p\/?/, "").replace(/\/.*$/, "");
+  var qEl = document.getElementById("question");
+  var tEl = document.getElementById("timer");
+  var oEl = document.getElementById("options");
+  var fEl = document.getElementById("form");
+  var sEl = document.getElementById("send");
+  var msg = document.getElementById("status");
+  var note = document.getElementById("note");
+
+  var poll = null;
+  var chosen = [];
+  var multiple = false;
+  var limit = 1;
+  var closed = false;
+
+  // Смещение часов между устройством и сервером.
+  //
+  // Таймер считается ТОЛЬКО по нему. Часы потребительских телефонов врут на
+  // минуты, и отсчёт по локальному времени погасил бы кнопку у части зрителей
+  // на десятой секунде ролика (architecture.md §5.5).
+  var skew = 0;
+
+  function say(text, cls) {
+    msg.textContent = text;
+    msg.className = "status" + (cls ? " " + cls : "");
+  }
+
+  function serverNow() { return Date.now() + skew; }
+
+  function tick() {
+    if (!poll) return;
+    var left = new Date(poll.ends_at).getTime() - serverNow();
+    if (left <= 0) {
+      tEl.textContent = "Голосование завершено";
+      tEl.className = "timer";
+      close("Голосование завершено.", "warn");
+      return;
+    }
+    var s = Math.ceil(left / 1000);
+    tEl.textContent = "Осталось " + (s >= 60 ? Math.floor(s / 60) + " мин " + (s % 60) + " с" : s + " с");
+    tEl.className = "timer" + (s <= 10 ? " urgent" : "");
+    // Просто setTimeout: requestAnimationFrame замирает в фоновой вкладке, а
+    // отсчёт до конца эфира останавливаться не должен.
+    setTimeout(tick, 250);
+  }
+
+  function close(text, cls) {
+    if (closed) return;
+    closed = true;
+    say(text, cls);
+    sEl.disabled = true;
+    Array.prototype.forEach.call(oEl.querySelectorAll("button"), function (b) { b.disabled = true; });
+  }
+
+  function render() {
+    qEl.textContent = poll.question;
+    multiple = poll.kind === "multiple";
+    // Предел приходит с сервера (ChoiceLimit): для single это 1, для multiple —
+    // max_choices или число вариантов. Держать его на клиенте отдельно значило
+    // бы дублировать доменное правило в двух местах.
+    limit = poll.max_choices || (multiple ? poll.options.length : 1);
+
+    poll.options.forEach(function (o) {
+      var b = document.createElement("button");
+      b.type = "button";
+      b.className = "opt";
+      b.textContent = o.text;
+      b.setAttribute("aria-pressed", "false");
+      b.addEventListener("click", function () {
+        if (closed) return;
+        var i = chosen.indexOf(o.id);
+        if (i >= 0) {
+          chosen.splice(i, 1);
+        } else if (multiple) {
+          if (chosen.length >= limit) return;
+          chosen.push(o.id);
+        } else {
+          chosen = [o.id];
+        }
+        Array.prototype.forEach.call(oEl.querySelectorAll(".opt"), function (el, idx) {
+          el.setAttribute("aria-pressed", chosen.indexOf(poll.options[idx].id) >= 0 ? "true" : "false");
+        });
+        sEl.disabled = chosen.length === 0;
+      });
+      oEl.appendChild(b);
+    });
+
+    if (multiple) {
+      note.textContent = "Можно выбрать вариантов: до " + limit + ".";
+      note.classList.remove("hidden");
+    }
+    fEl.classList.remove("hidden");
+  }
+
+  fEl.addEventListener("submit", function (e) {
+    e.preventDefault();
+    if (closed || chosen.length === 0) return;
+    sEl.disabled = true;
+    say("Отправляем…");
+
+    fetch("/api/polls/" + encodeURIComponent(pollId) + "/vote", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ option_ids: chosen })
+    }).then(function (r) {
+      // Цифр в ответе нет намеренно: промежуточные результаты не показываются,
+      // чтобы не создавать bandwagon effect (architecture.md §5.2).
+      if (r.status === 200) return close("Голос принят. Спасибо!", "ok");
+      if (r.status === 409) return close("По этому устройству уже голосовали.", "warn");
+      if (r.status === 410) return close("Голосование завершено.", "warn");
+      if (r.status === 425) { say("Голосование ещё не началось.", "warn"); sEl.disabled = false; return; }
+      if (r.status === 429) { say("Слишком часто. Подождите немного.", "warn"); sEl.disabled = false; return; }
+      if (r.status === 401) { say("Сессия устарела, обновите страницу.", "err"); return; }
+      say("Не удалось отправить голос.", "err");
+      sEl.disabled = false;
+    }).catch(function () {
+      say("Нет связи. Попробуйте ещё раз.", "err");
+      sEl.disabled = false;
+    });
+  });
+
+  if (!pollId) {
+    qEl.textContent = "Опрос не указан";
+    return;
+  }
+
+  // Порядок важен: сначала токен (он ставит куку), потом метаданные. Без куки
+  // голос вернёт 401.
+  fetch("/api/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ poll_id: pollId })
+  }).then(function () {
+    return fetch("/api/polls/" + encodeURIComponent(pollId));
+  }).then(function (r) {
+    if (r.status === 404) throw new Error("Опрос не найден");
+    if (!r.ok) throw new Error("Не удалось загрузить опрос");
+    return r.json();
+  }).then(function (data) {
+    poll = data;
+    skew = new Date(data.server_time).getTime() - Date.now();
+    render();
+    tick();
+  }).catch(function (e) {
+    qEl.textContent = e.message || "Ошибка загрузки";
+    tEl.textContent = "";
+  });
+})();
+</script>
 </body>
 </html>

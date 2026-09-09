@@ -3,6 +3,7 @@ package vote
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"sync"
@@ -22,7 +23,7 @@ type fakeSink struct {
 	mu     sync.Mutex
 	counts map[string]int64
 	voters map[uuid.UUID]int64
-	fail   bool
+	fail   error
 	calls  int
 }
 
@@ -37,8 +38,8 @@ func (f *fakeSink) Push(_ context.Context, pollID uuid.UUID, shard int, optionID
 	defer f.mu.Unlock()
 	f.calls++
 
-	if f.fail {
-		return errSinkDown
+	if f.fail != nil {
+		return f.fail
 	}
 	for i, n := range d.Options {
 		if n != 0 {
@@ -49,10 +50,10 @@ func (f *fakeSink) Push(_ context.Context, pollID uuid.UUID, shard int, optionID
 	return nil
 }
 
-func (f *fakeSink) setFail(v bool) {
+func (f *fakeSink) setFail(err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.fail = v
+	f.fail = err
 }
 
 func (f *fakeSink) option(pollID uuid.UUID, optID string) int64 {
@@ -107,8 +108,9 @@ func TestFlushSendsDeltas(t *testing.T) {
 	}
 }
 
-// Неудачный flush не должен терять голоса: Swap уже забрал их из памяти, и без
-// возврата они пропали бы при полностью живом инстансе (architecture.md §5.6).
+// Заведомо недоставленная отправка возвращает дельту: Swap уже забрал её из
+// памяти, и без возврата голоса пропали бы при живом инстансе
+// (architecture.md §5.6).
 func TestFailedFlushRestoresAndRetries(t *testing.T) {
 	m := newFakeSink()
 	b := newTestBatcher(m)
@@ -121,7 +123,7 @@ func TestFailedFlushRestoresAndRetries(t *testing.T) {
 		c.Add([]int{0})
 	}
 
-	m.setFail(true)
+	m.setFail(errSinkDown)
 	b.Flush(context.Background())
 
 	if got := m.option(pollID, opt); got != 0 {
@@ -131,7 +133,7 @@ func TestFailedFlushRestoresAndRetries(t *testing.T) {
 	// Голоса пришли, пока связь была недоступна.
 	c.Add([]int{0})
 
-	m.setFail(false)
+	m.setFail(nil)
 	b.Flush(context.Background())
 
 	if got := m.option(pollID, opt); got != 6 {
@@ -231,5 +233,62 @@ func TestConcurrentRegisterAndLookup(t *testing.T) {
 		if _, ok := b.Lookup(id); !ok {
 			t.Fatalf("опрос %s потерян при параллельной регистрации", id)
 		}
+	}
+}
+
+// Неоднозначный исход отправки НЕ повторяется.
+//
+// HINCRBY не идемпотентен: если дельта всё же применилась, ретрай задвоит
+// голоса. Двойной счёт для опроса хуже потери — на том же основании дедуп стоит
+// до инкремента (architecture.md §5.4).
+//
+// Регрессия на реальную ошибку: общий с дедупом клиент Redis накрывал пайплайн
+// батчера пятидесятимиллисекундным ReadTimeout, команды выполнялись, ответ не
+// доходил, и повтор задваивал голоса.
+func TestAmbiguousFlushIsDroppedNotRetried(t *testing.T) {
+	m := newFakeSink()
+	b := newTestBatcher(m)
+
+	pollID := uuid.New()
+	opt := uuid.New().String()
+	c := b.Register(pollID, []string{opt})
+	for i := 0; i < 5; i++ {
+		c.Add([]int{0})
+	}
+
+	// Приёмник сообщает, что исход неизвестен.
+	m.setFail(fmt.Errorf("%w: read tcp: i/o timeout", ErrMaybeApplied))
+	b.Flush(context.Background())
+
+	// Дельта выброшена, а не возвращена: следующий сброс не должен её повторить.
+	m.setFail(nil)
+	b.Flush(context.Background())
+
+	if got := m.option(pollID, opt); got != 0 {
+		t.Errorf("после неоднозначной отправки повторно ушло %d голосов, ожидалось 0", got)
+	}
+	if got := m.votersOf(pollID); got != 0 {
+		t.Errorf("после неоднозначной отправки повторно ушло %d участников, ожидалось 0", got)
+	}
+}
+
+// Ошибка дозвона однозначна: до Redis не дошло ничего, дельту надо вернуть.
+func TestDialErrorIsRetried(t *testing.T) {
+	m := newFakeSink()
+	b := newTestBatcher(m)
+
+	pollID := uuid.New()
+	opt := uuid.New().String()
+	c := b.Register(pollID, []string{opt})
+	c.Add([]int{0})
+
+	m.setFail(errSinkDown)
+	b.Flush(context.Background())
+
+	m.setFail(nil)
+	b.Flush(context.Background())
+
+	if got := m.option(pollID, opt); got != 1 {
+		t.Errorf("после ошибки дозвона голос не восстановлен: %d, ожидался 1", got)
 	}
 }

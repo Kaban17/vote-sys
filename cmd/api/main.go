@@ -69,11 +69,27 @@ func run(levelVar *slog.LevelVar) error {
 	}
 	defer db.Close()
 
+	// Два клиента, а не один, потому что у операций разные бюджеты.
+	//
+	// Дедуп лежит на горячем пути и обязан уложиться в 50 мс. Сброс счётчиков
+	// идёт раз в 150 мс пайплайном и столько времени не имеет. Общий клиент
+	// накрывал бы обе операции одним ReadTimeout — и на стенде это привело к
+	// тому, что таймаут дедупа срабатывал на пайплайне батчера: команды
+	// выполнялись, ответ не доходил, дельта возвращалась и слалась повторно,
+	// задваивая голоса.
 	rdb, err := platform.NewRedis(ctx, cfg.RedisAddr, cfg.RedisPoolSize, cfg.DedupTimeout)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = rdb.Close() }()
+
+	// Клиент счётчиков: бюджет с запасом относительно интервала сброса. Пул
+	// маленький — писатель один, читатель снапшотов один.
+	countersRdb, err := platform.NewRedis(ctx, cfg.RedisAddr, 8, 4*cfg.FlushInterval)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = countersRdb.Close() }()
 
 	slog.Info("пулы прогреты",
 		"postgres_conns", cfg.PostgresMaxConns,
@@ -91,7 +107,7 @@ func run(levelVar *slog.LevelVar) error {
 	slog.Info("кэш опросов прогрет", "polls", warmed)
 
 	// 3. Батчер: 250K инкрементов в секунду в памяти → ~1000 ops/sec в Redis.
-	sink := vote.NewRedisSink(rdb, cfg.FlushInterval)
+	sink := vote.NewRedisSink(countersRdb, 2*cfg.FlushInterval)
 	batcher := vote.NewBatcher(sink, cfg.Shard(), cfg.FlushInterval, slog.Default())
 	batcherCtx, stopBatcher := context.WithCancel(context.Background())
 	// Страховка на путях раннего выхода: штатная остановка идёт из
@@ -122,7 +138,7 @@ func run(levelVar *slog.LevelVar) error {
 	//    Postgres раз в пять секунд. Ни один запрос к результатам не идёт в
 	//    Redis напрямую (architecture.md §5.2).
 	snapshots := results.NewSnapshotter(
-		results.NewRedisSource(rdb, cfg.SnapshotInterval),
+		results.NewRedisSource(countersRdb, cfg.SnapshotInterval),
 		cache, cfg.CounterShards, cfg.SnapshotInterval, resultsSettleWindow, slog.Default(),
 	)
 	persister := results.NewPersister(store, snapshots, cfg.PersistInterval, slog.Default())

@@ -12,10 +12,15 @@ import (
 )
 
 type pollResponse struct {
-	ID       string           `json:"id"`
-	Question string           `json:"question"`
-	Kind     string           `json:"kind"`
-	Options  []optionResponse `json:"options"`
+	ID       string `json:"id"`
+	Question string `json:"question"`
+	Kind     string `json:"kind"`
+	// MaxChoices нужен клиенту, чтобы не давать выбрать больше разрешённого.
+	// Без него интерфейс позволял бы отправить заведомо невалидный набор и
+	// получить 400 уже после нажатия — то есть терял бы голос из-за того, что
+	// знал сервер, но не знал зритель.
+	MaxChoices int              `json:"max_choices,omitempty"`
+	Options    []optionResponse `json:"options"`
 
 	// EndsAt отдаётся БЕЗ grace period. Запас применяется только к приёму
 	// голоса; если показать его клиенту, клиентский таймер и серверная отсечка
@@ -68,10 +73,11 @@ func (s *Server) handleGetPoll(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, pollResponse{
-		ID:       p.ID.String(),
-		Question: p.Question,
-		Kind:     string(p.Kind),
-		Options:  opts,
+		ID:         p.ID.String(),
+		Question:   p.Question,
+		Kind:       string(p.Kind),
+		MaxChoices: p.ChoiceLimit(),
+		Options:    opts,
 		// ends_at БЕЗ grace period: запас применяется только к приёму, и если
 		// показать его клиенту, таймер и серверная отсечка разойдутся
 		// (architecture.md §5.5).

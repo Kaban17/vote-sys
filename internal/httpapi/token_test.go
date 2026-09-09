@@ -130,6 +130,81 @@ func TestCookieSecureFollowsConfig(t *testing.T) {
 	}
 }
 
+// Повторный минт с валидной кукой НЕ выдаёт новый токен.
+//
+// Регрессия на реальный обход, найденный при ручной проверке: лендинг
+// запрашивает токен при каждой загрузке, и новый затирал куку — перезагрузка
+// страницы давала новую личность и новое право голоса. Перезагрузить страницу
+// умеет любой зритель, то есть обход был ниже планки, которую задаёт ТЗ.
+func TestMintIsIdempotentWithValidCookie(t *testing.T) {
+	cfg := &config.Config{
+		CounterShards: 1, AccessLogSampleN: 1,
+		TokenTTL: time.Hour, CookieSecure: false,
+	}
+	issuer := token.NewIssuer([]byte("секрет"), cfg.TokenTTL)
+	srv := quiet(NewServer(cfg, Deps{Tokens: issuer}))
+	srv.MarkReady()
+	h := srv.Routes()
+
+	pollID := uuid.New()
+	first := mint(t, h, `{"poll_id":"`+pollID.String()+`"}`)
+	tok := first.Result().Cookies()[0].Value
+
+	// Второй запрос с уже установленной кукой.
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/api/token",
+		strings.NewReader(`{"poll_id":"`+pollID.String()+`"}`))
+	r.AddCookie(&http.Cookie{Name: token.CookieName, Value: tok})
+	h.ServeHTTP(rec, r)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("код %d, want 204", rec.Code)
+	}
+	if n := len(rec.Result().Cookies()); n != 0 {
+		t.Errorf("при валидной куке выдано %d новых токенов, ожидалось 0", n)
+	}
+}
+
+// А вот токен от ДРУГОГО опроса не годится: зритель должен получить свой.
+func TestMintIssuesNewTokenForDifferentPoll(t *testing.T) {
+	cfg := &config.Config{
+		CounterShards: 1, AccessLogSampleN: 1,
+		TokenTTL: time.Hour, CookieSecure: false,
+	}
+	issuer := token.NewIssuer([]byte("секрет"), cfg.TokenTTL)
+	srv := quiet(NewServer(cfg, Deps{Tokens: issuer}))
+	srv.MarkReady()
+	h := srv.Routes()
+
+	otherPoll := uuid.New()
+	tok, _ := issuer.Issue(otherPoll, time.Now())
+
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/api/token",
+		strings.NewReader(`{"poll_id":"`+uuid.New().String()+`"}`))
+	r.AddCookie(&http.Cookie{Name: token.CookieName, Value: tok})
+	h.ServeHTTP(rec, r)
+
+	if len(rec.Result().Cookies()) != 1 {
+		t.Error("для другого опроса должен выдаваться новый токен")
+	}
+}
+
+// Испорченная кука не должна запирать зрителя без токена.
+func TestMintReplacesInvalidCookie(t *testing.T) {
+	h := tokenServer(t, false)
+
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/api/token",
+		strings.NewReader(`{"poll_id":"`+uuid.New().String()+`"}`))
+	r.AddCookie(&http.Cookie{Name: token.CookieName, Value: "мусор"})
+	h.ServeHTTP(rec, r)
+
+	if len(rec.Result().Cookies()) != 1 {
+		t.Error("при невалидной куке должен выдаваться новый токен")
+	}
+}
+
 // Выпущенный токен должен проходить проверку тем же секретом — сквозная связка
 // хендлера и пакета token.
 func TestMintedTokenVerifies(t *testing.T) {
