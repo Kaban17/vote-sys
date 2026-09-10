@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -201,7 +202,7 @@ func fire(client *http.Client, o options, poll *pollInfo, offsets []time.Duratio
 
 func castOne(client *http.Client, o options, poll *pollInfo, i int, m *metrics) {
 	// Каждый зритель — свой токен: дедуп должен видеть разные личности.
-	tok, _, err := mint(client, o, poll.ID)
+	name, tok, _, err := mint(client, o, poll.ID)
 	if err != nil || tok == "" {
 		// Отказ минта считается отдельно: он не должен попадать в латентность
 		// голоса, но и молчать о нём нельзя — без токена голос невозможен.
@@ -215,7 +216,7 @@ func castOne(client *http.Client, o options, poll *pollInfo, i int, m *metrics) 
 	req, _ := http.NewRequest(http.MethodPost,
 		o.target+"/api/polls/"+poll.ID+"/vote", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Cookie", "vote_token="+tok)
+	req.Header.Set("Cookie", name+"="+tok)
 
 	began := time.Now()
 	resp, err := client.Do(req)
@@ -229,23 +230,28 @@ func castOne(client *http.Client, o options, poll *pollInfo, i int, m *metrics) 
 	m.record(took, resp.StatusCode, nil)
 }
 
-func mint(client *http.Client, o options, pollID string) (string, int, error) {
+// cookiePrefix дублирует token.CookiePrefix: генератор — внешний клиент и лезть
+// во внутренние пакеты сервиса не должен.
+const cookiePrefix = "vote_token_"
+
+func mint(client *http.Client, o options, pollID string) (string, string, int, error) {
 	body := fmt.Sprintf(`{"poll_id":"%s"}`, pollID)
 	req, _ := http.NewRequest(http.MethodPost, o.target+"/api/token", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", 0, err
+		return "", "", 0, err
 	}
 	defer func() { _, _ = io.Copy(io.Discard, resp.Body); _ = resp.Body.Close() }()
 
+	// Имя куки включает идентификатор опроса, поэтому ищем по префиксу.
 	for _, c := range resp.Cookies() {
-		if c.Name == "vote_token" {
-			return c.Value, resp.StatusCode, nil
+		if strings.HasPrefix(c.Name, cookiePrefix) {
+			return c.Name, c.Value, resp.StatusCode, nil
 		}
 	}
-	return "", resp.StatusCode, nil
+	return "", "", resp.StatusCode, nil
 }
 
 // --- опрос ------------------------------------------------------------------

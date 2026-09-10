@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"time"
@@ -52,6 +53,32 @@ type adminOptionCount struct {
 	Text     string  `json:"text"`
 	Votes    int64   `json:"votes"`
 	Percent  float64 `json:"percent"` // от Voters, не от суммы
+}
+
+// intParam разбирает неотрицательный числовой параметр запроса.
+//
+// Невалидный ввод — это 400, а не 500 и не молчаливый ноль. До правки
+// ?offset=-5 доезжал до SQL и возвращал «внутреннюю ошибку» на ошибку клиента,
+// а ?offset=abc молча превращался в ноль: разбор игнорировал и значение, и
+// ошибку.
+//
+// max = 0 означает «верхней границы нет».
+func intParam(r *http.Request, name string, def, max int) (int, error) {
+	raw := r.URL.Query().Get(name)
+	if raw == "" {
+		return def, nil
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("%s: ожидается целое число", name)
+	}
+	if v < 0 {
+		return 0, fmt.Errorf("%s: не может быть отрицательным", name)
+	}
+	if max > 0 && v > max {
+		return 0, fmt.Errorf("%s: не больше %d", name, max)
+	}
+	return v, nil
 }
 
 func stateName(s poll.State) string {
@@ -111,9 +138,20 @@ func (s *Server) handleCreatePoll(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, toAdminPoll(p, time.Now()))
 }
 
+// maxListLimit — потолок размера страницы.
+const maxListLimit = 200
+
 func (s *Server) handleListPolls(w http.ResponseWriter, r *http.Request) {
-	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
+	limit, err := intParam(r, "limit", 0, maxListLimit)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	offset, err := intParam(r, "offset", 0, 0)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
 
 	polls, err := s.polls.List(r.Context(), limit, offset)
 	if err != nil {

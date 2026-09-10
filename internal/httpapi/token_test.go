@@ -36,7 +36,8 @@ func mint(t *testing.T, h http.Handler, body string) *httptest.ResponseRecorder 
 
 func TestMintSetsCookie(t *testing.T) {
 	h := tokenServer(t, false)
-	rec := mint(t, h, `{"poll_id":"`+uuid.New().String()+`"}`)
+	pollID := uuid.New()
+	rec := mint(t, h, `{"poll_id":"`+pollID.String()+`"}`)
 
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("код %d, want 204", rec.Code)
@@ -48,8 +49,8 @@ func TestMintSetsCookie(t *testing.T) {
 	}
 	c := cookies[0]
 
-	if c.Name != token.CookieName {
-		t.Errorf("имя куки %q, want %q", c.Name, token.CookieName)
+	if c.Name != token.CookieName(pollID) {
+		t.Errorf("имя куки %q, want %q", c.Name, token.CookieName(pollID))
 	}
 	if len(c.Value) != token.TokenLen {
 		t.Errorf("длина токена %d, want %d", len(c.Value), token.TokenLen)
@@ -154,7 +155,7 @@ func TestMintIsIdempotentWithValidCookie(t *testing.T) {
 	rec := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodPost, "/api/token",
 		strings.NewReader(`{"poll_id":"`+pollID.String()+`"}`))
-	r.AddCookie(&http.Cookie{Name: token.CookieName, Value: tok})
+	r.AddCookie(&http.Cookie{Name: token.CookieName(pollID), Value: tok})
 	h.ServeHTTP(rec, r)
 
 	if rec.Code != http.StatusNoContent {
@@ -165,8 +166,15 @@ func TestMintIsIdempotentWithValidCookie(t *testing.T) {
 	}
 }
 
-// А вот токен от ДРУГОГО опроса не годится: зритель должен получить свой.
-func TestMintIssuesNewTokenForDifferentPoll(t *testing.T) {
+// Кука своя у каждого опроса, поэтому минт соседнего опроса НЕ трогает токен
+// текущего.
+//
+// Регрессия на воспроизведённый обход: с единственной кукой на все опросы
+// последовательность «голос в A → минт B → возврат в A» выдавала в A новую
+// личность, то есть второй принятый голос. Навигация между двумя живыми
+// опросами — не приём для технически подкованных, а обычное поведение зрителя в
+// вечер с несколькими роликами.
+func TestMintForOtherPollDoesNotClobberToken(t *testing.T) {
 	cfg := &config.Config{
 		CounterShards: 1, AccessLogSampleN: 1,
 		TokenTTL: time.Hour, CookieSecure: false,
@@ -176,28 +184,52 @@ func TestMintIssuesNewTokenForDifferentPoll(t *testing.T) {
 	srv.MarkReady()
 	h := srv.Routes()
 
-	otherPoll := uuid.New()
-	tok, _ := issuer.Issue(otherPoll, time.Now())
+	pollA, pollB := uuid.New(), uuid.New()
 
-	rec := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodPost, "/api/token",
-		strings.NewReader(`{"poll_id":"`+uuid.New().String()+`"}`))
-	r.AddCookie(&http.Cookie{Name: token.CookieName, Value: tok})
-	h.ServeHTTP(rec, r)
+	// Зритель получил токен в опросе A.
+	tokA := mint(t, h, `{"poll_id":"`+pollA.String()+`"}`).Result().Cookies()[0].Value
 
-	if len(rec.Result().Cookies()) != 1 {
-		t.Error("для другого опроса должен выдаваться новый токен")
+	// Ушёл в опрос B: браузер шлёт куку A, потому что Path у обеих «/».
+	recB := httptest.NewRecorder()
+	rB := httptest.NewRequest(http.MethodPost, "/api/token",
+		strings.NewReader(`{"poll_id":"`+pollB.String()+`"}`))
+	rB.AddCookie(&http.Cookie{Name: token.CookieName(pollA), Value: tokA})
+	h.ServeHTTP(recB, rB)
+
+	cookiesB := recB.Result().Cookies()
+	if len(cookiesB) != 1 {
+		t.Fatalf("для опроса B выдано %d кук, ожидалась 1", len(cookiesB))
+	}
+	if cookiesB[0].Name == token.CookieName(pollA) {
+		t.Fatal("минт опроса B перезаписал куку опроса A — это и есть обход")
+	}
+	if cookiesB[0].Name != token.CookieName(pollB) {
+		t.Errorf("имя куки %q, ожидалось %q", cookiesB[0].Name, token.CookieName(pollB))
+	}
+
+	// Вернулся в A: токен A всё ещё в браузере, значит минт идемпотентен и
+	// новой личности не выдаёт.
+	recA := httptest.NewRecorder()
+	rA := httptest.NewRequest(http.MethodPost, "/api/token",
+		strings.NewReader(`{"poll_id":"`+pollA.String()+`"}`))
+	rA.AddCookie(&http.Cookie{Name: token.CookieName(pollA), Value: tokA})
+	rA.AddCookie(&http.Cookie{Name: token.CookieName(pollB), Value: cookiesB[0].Value})
+	h.ServeHTTP(recA, rA)
+
+	if n := len(recA.Result().Cookies()); n != 0 {
+		t.Errorf("при возврате в A выдано %d новых токенов, ожидалось 0", n)
 	}
 }
 
 // Испорченная кука не должна запирать зрителя без токена.
 func TestMintReplacesInvalidCookie(t *testing.T) {
 	h := tokenServer(t, false)
+	pollID := uuid.New()
 
 	rec := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodPost, "/api/token",
-		strings.NewReader(`{"poll_id":"`+uuid.New().String()+`"}`))
-	r.AddCookie(&http.Cookie{Name: token.CookieName, Value: "мусор"})
+		strings.NewReader(`{"poll_id":"`+pollID.String()+`"}`))
+	r.AddCookie(&http.Cookie{Name: token.CookieName(pollID), Value: "мусор"})
 	h.ServeHTTP(rec, r)
 
 	if len(rec.Result().Cookies()) != 1 {

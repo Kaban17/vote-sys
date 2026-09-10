@@ -94,7 +94,7 @@ func castVote(t *testing.T, srv *Server, p *poll.Poll, optionIDs ...uuid.UUID) *
 	body := `{"option_ids":[` + strings.Join(ids, ",") + `]}`
 
 	r := httptest.NewRequest(http.MethodPost, "/api/polls/"+p.ID.String()+"/vote", strings.NewReader(body))
-	r.AddCookie(&http.Cookie{Name: token.CookieName, Value: tok})
+	r.AddCookie(&http.Cookie{Name: token.CookieName(p.ID), Value: tok})
 
 	rec := httptest.NewRecorder()
 	srv.Routes().ServeHTTP(rec, r)
@@ -172,5 +172,30 @@ func TestBypassedDedupStillCounts(t *testing.T) {
 
 	if got := sink.votes[p.Options[2].ID.String()]; got != 1 {
 		t.Errorf("при bypassed голос не засчитан: %v", sink.votes)
+	}
+}
+
+// Невалидный параметр запроса — это 400, а не 500 и не молчаливый ноль.
+//
+// Регрессия на находку внешнего ревью: ?offset=-5 доезжал до SQL и возвращал
+// «внутреннюю ошибку» на ошибку клиента, а ?offset=abc молча превращался в ноль.
+func TestListParamsValidated(t *testing.T) {
+	srv := quiet(NewServer(
+		&config.Config{CounterShards: 1, AccessLogSampleN: 1, AdminBearerToken: "t"},
+		Deps{},
+	))
+	srv.MarkReady()
+	h := srv.Routes()
+
+	bad := []string{"offset=-5", "limit=-1", "offset=abc", "limit=abc", "limit=999999"}
+	for _, q := range bad {
+		rec := httptest.NewRecorder()
+		r := httptest.NewRequest(http.MethodGet, "/api/admin/polls?"+q, nil)
+		r.Header.Set("Authorization", "Bearer t")
+		h.ServeHTTP(rec, r)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("?%s → %d, ожидался 400", q, rec.Code)
+		}
 	}
 }

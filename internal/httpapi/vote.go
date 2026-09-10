@@ -160,7 +160,7 @@ func dedupTTL(p *poll.Poll, grace time.Duration, now time.Time) time.Duration {
 
 // voterFrom достаёт токен из куки и проверяет подпись.
 func (s *Server) voterFrom(r *http.Request, pollID uuid.UUID, now time.Time) (token.VoterID, bool) {
-	c, err := r.Cookie(token.CookieName)
+	c, err := r.Cookie(token.CookieName(pollID))
 	if err != nil {
 		return "", false
 	}

@@ -67,7 +67,7 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 	// которую задаёт ТЗ («на уровне обычных, не технически подкованных
 	// пользователей»). Очистка куки по-прежнему работает — и по-прежнему
 	// разрешена (architecture.md §5.3).
-	if c, err := r.Cookie(token.CookieName); err == nil {
+	if c, err := r.Cookie(token.CookieName(pollID)); err == nil {
 		if _, ok := s.tokens.Verify(pollID, c.Value, time.Now()); ok {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -82,7 +82,7 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 	}
 
 	http.SetCookie(w, &http.Cookie{
-		Name:  token.CookieName,
+		Name:  token.CookieName(pollID),
 		Value: tok,
 		Path:  "/",
 		// HttpOnly: скрипту лендинга токен не нужен, браузер отправит куку сам.

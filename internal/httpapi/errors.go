@@ -39,14 +39,6 @@ func writeError(w http.ResponseWriter, status int, code, msg string) {
 	writeJSON(w, status, apiError{Code: code, Message: msg})
 }
 
-// notImplemented — заглушка для ещё не реализованных хендлеров.
-//
-// Честнее пустого 200: несделанное должно быть отличимо от сделанного и
-// сломанного, иначе первый же сквозной прогон введёт в заблуждение.
-func notImplemented(w http.ResponseWriter, step string) {
-	writeError(w, http.StatusNotImplemented, "not_implemented", "будет реализовано: "+step)
-}
-
 // requireAdmin — статический bearer-токен из окружения.
 //
 // Для тестового задания достаточно; в проде здесь был бы полноценный IdP.
